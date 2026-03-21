@@ -10,13 +10,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	_ "github.com/duckdb/duckdb-go/v2"
 	esv7 "github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v8"
@@ -28,7 +26,6 @@ import (
 	"go.uber.org/dig"
 	"google.golang.org/grpc"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
@@ -39,7 +36,6 @@ import (
 	neo4jRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/neo4j"
 	postgresRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/postgres"
 	qdrantRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/qdrant"
-	sqliteRetrieverRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/sqlite"
 	weaviateRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/weaviate"
 	"github.com/Tencent/WeKnora/internal/application/service"
 	chatpipline "github.com/Tencent/WeKnora/internal/application/service/chat_pipline"
@@ -378,21 +374,21 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 			os.Getenv("DB_PORT"),
 			os.Getenv("DB_NAME"),
 		)
-	case "sqlite":
-		dbPath := os.Getenv("DB_PATH")
-		if dbPath == "" {
-			dbPath = "./data/weknora.db"
-		}
-		if dir := filepath.Dir(dbPath); dir != "." && dir != "" {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return nil, fmt.Errorf("failed to create SQLite data directory %s: %w", dir, err)
-			}
-		}
-		sqlite_vec.Auto()
-		dsn := dbPath + "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on"
-		dialector = sqlite.Open(dsn)
-		migrateDSN = "sqlite3://" + dbPath
-		logger.Infof(context.Background(), "DB Config: driver=sqlite path=%s", dbPath)
+	//case "sqlite":
+	//	dbPath := os.Getenv("DB_PATH")
+	//	if dbPath == "" {
+	//		dbPath = "./data/weknora.db"
+	//	}
+	//	if dir := filepath.Dir(dbPath); dir != "." && dir != "" {
+	//		if err := os.MkdirAll(dir, 0755); err != nil {
+	//			return nil, fmt.Errorf("failed to create SQLite data directory %s: %w", dir, err)
+	//		}
+	//	}
+	//	sqlite_vec.Auto()
+	//	dsn := dbPath + "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on"
+	//	dialector = sqlite.Open(dsn)
+	//	migrateDSN = "sqlite3://" + dbPath
+	//	logger.Infof(context.Background(), "DB Config: driver=sqlite path=%s", dbPath)
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", os.Getenv("DB_DRIVER"))
 	}
@@ -604,16 +600,16 @@ func initRetrieveEngineRegistry(db *gorm.DB, cfg *config.Config) (interfaces.Ret
 			log.Infof("Register postgres retrieve engine success")
 		}
 	}
-	if slices.Contains(retrieveDriver, "sqlite") {
-		sqliteRepo := sqliteRetrieverRepo.NewSQLiteRetrieveEngineRepository(db)
-		if err := registry.Register(
-			retriever.NewKVHybridRetrieveEngine(sqliteRepo, types.SQLiteRetrieverEngineType),
-		); err != nil {
-			log.Errorf("Register sqlite retrieve engine failed: %v", err)
-		} else {
-			log.Infof("Register sqlite retrieve engine success")
-		}
-	}
+	//if slices.Contains(retrieveDriver, "sqlite") {
+	//	sqliteRepo := sqliteRetrieverRepo.NewSQLiteRetrieveEngineRepository(db)
+	//	if err := registry.Register(
+	//		retriever.NewKVHybridRetrieveEngine(sqliteRepo, types.SQLiteRetrieverEngineType),
+	//	); err != nil {
+	//		log.Errorf("Register sqlite retrieve engine failed: %v", err)
+	//	} else {
+	//		log.Infof("Register sqlite retrieve engine success")
+	//	}
+	//}
 	if slices.Contains(retrieveDriver, "elasticsearch_v8") {
 		client, err := elasticsearch.NewTypedClient(elasticsearch.Config{
 			Addresses: []string{os.Getenv("ELASTICSEARCH_ADDR")},

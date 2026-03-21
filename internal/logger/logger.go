@@ -3,6 +3,7 @@ package logger
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"runtime"
@@ -135,7 +136,21 @@ func init() {
 	appLogger.SetLevel(logLevel)
 
 	// 统一输出到 stdout，确保在 Docker 容器中与 GORM/GIN 日志合并展示
-	appLogger.SetOutput(os.Stdout)
+	//appLogger.SetOutput(os.Stdout)
+	writers := []io.Writer{os.Stdout}
+	if logPath := os.Getenv("LOG_PATH"); logPath != "" {
+		if err := os.MkdirAll(path.Dir(logPath), 0755); err == nil {
+			if file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666); err == nil {
+				writers = append(writers, file)
+			} else {
+				fmt.Printf("Warning: failed to open log file %s: %v\n", logPath, err)
+			}
+		} else {
+			fmt.Printf("Warning: failed to create log directory for %s: %v\n", logPath, err)
+		}
+	}
+
+	appLogger.SetOutput(io.MultiWriter(writers...))
 
 	// 非终端（如 Docker 日志采集）禁用 ANSI 颜色，避免日志聚合/检索异常
 	forceColor := false
