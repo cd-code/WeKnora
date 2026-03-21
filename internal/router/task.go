@@ -1,11 +1,13 @@
 package router
 
 import (
+	"context"
 	"log"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/hibiken/asynq"
@@ -34,11 +36,13 @@ func getAsynqRedisClientOpt() *asynq.RedisClientOpt {
 		}
 	}
 	opt := &asynq.RedisClientOpt{
-		Addr:         os.Getenv("REDIS_ADDR"),
-		Username:     os.Getenv("REDIS_USERNAME"),
-		Password:     os.Getenv("REDIS_PASSWORD"),
-		ReadTimeout:  100 * time.Millisecond,
-		WriteTimeout: 200 * time.Millisecond,
+		Addr:     os.Getenv("REDIS_ADDR"),
+		Username: os.Getenv("REDIS_USERNAME"),
+		Password: os.Getenv("REDIS_PASSWORD"),
+		//ReadTimeout:  100 * time.Millisecond,
+		//WriteTimeout: 200 * time.Millisecond,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
 		DB:           db,
 	}
 	return opt
@@ -64,6 +68,7 @@ func NewAsynqServer() *asynq.Server {
 				"default":  3, // Default priority queue
 				"low":      1, // Lowest priority queue
 			},
+			Logger: logger.GetLogger(context.Background()),
 		},
 	)
 	return srv
