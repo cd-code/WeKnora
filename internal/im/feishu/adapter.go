@@ -205,6 +205,8 @@ type feishuEvent struct {
 
 type feishuMessage struct {
 	MessageID   string `json:"message_id"`
+	RootID      string `json:"root_id"`
+	ParentID    string `json:"parent_id"`
 	MessageType string `json:"message_type"`
 	ChatType    string `json:"chat_type"`
 	ChatID      string `json:"chat_id"`
@@ -263,6 +265,12 @@ func (a *Adapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, error) {
 	}
 	msg := eventBody.Event.Message
 
+	// Compute thread ID: use root_id for threaded replies, or message_id for top-level messages.
+	threadID := msg.RootID
+	if threadID == "" {
+		threadID = msg.MessageID
+	}
+
 	// Determine chat type
 	chatType := im.ChatTypeDirect
 	chatID := ""
@@ -308,6 +316,7 @@ func (a *Adapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, error) {
 			ChatType:    chatType,
 			Content:     strings.TrimSpace(content),
 			MessageID:   msg.MessageID,
+			ThreadID:    threadID,
 		}, nil
 
 	case "file":
@@ -328,6 +337,7 @@ func (a *Adapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, error) {
 			ChatID:      chatID,
 			ChatType:    chatType,
 			MessageID:   msg.MessageID,
+			ThreadID:    threadID,
 			FileKey:     fileContent.FileKey,
 			FileName:    fileContent.FileName,
 		}, nil
@@ -349,6 +359,7 @@ func (a *Adapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, error) {
 			ChatID:      chatID,
 			ChatType:    chatType,
 			MessageID:   msg.MessageID,
+			ThreadID:    threadID,
 			FileKey:     imageContent.ImageKey,
 			FileName:    imageContent.ImageKey + ".png",
 		}, nil
@@ -411,6 +422,7 @@ func (a *Adapter) ParseCallback(c *gin.Context) (*im.IncomingMessage, error) {
 			ChatType:    chatType,
 			Content:     content,
 			MessageID:   msg.MessageID,
+			ThreadID:    threadID,
 		}, nil
 
 	default:
@@ -476,11 +488,28 @@ func (a *Adapter) SendReply(ctx context.Context, incoming *im.IncomingMessage, r
 // File download support via Feishu GetMessageResource API
 // ──────────────────────────────────────────────────────────────────────
 
+// feishuSafePathParam checks that a Feishu API path parameter contains only
+// safe characters (alphanumeric, hyphen, underscore). This prevents path
+// traversal attacks via crafted callback payloads.
+func feishuSafePathParam(s string) bool {
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
 // DownloadFile downloads a file or image attachment from a Feishu message.
 // Uses the GetMessageResource API: GET /open-apis/im/v1/messages/:message_id/resources/:file_key?type={file|image}
 func (a *Adapter) DownloadFile(ctx context.Context, msg *im.IncomingMessage) (io.ReadCloser, string, error) {
 	if msg.FileKey == "" || msg.MessageID == "" {
 		return nil, "", fmt.Errorf("file_key and message_id are required")
+	}
+
+	// SSRF/path-traversal protection: validate path parameters contain only safe characters
+	if !feishuSafePathParam(msg.MessageID) || !feishuSafePathParam(msg.FileKey) {
+		return nil, "", fmt.Errorf("invalid message_id or file_key format")
 	}
 
 	accessToken, err := a.getTenantAccessToken(ctx)
@@ -666,75 +695,8 @@ func (a *Adapter) SendStreamChunk(ctx context.Context, incoming *im.IncomingMess
 	return a.cardkitUpdateElement(ctx, accessToken, streamID, streamingElementID, fullContent, seq)
 }
 
-// transformThinkBlocks converts <think>...</think> blocks into Feishu-compatible
-// markdown blockquotes. Handles both complete blocks and in-progress blocks
-// (where </think> has not yet arrived during streaming).
-//
-// Output format (matching the OpenClaw Feishu convention):
-//
-//	> 💭 **思考过程**
-//	> thinking line 1
-//	> thinking line 2
-//
-//	---
-//
-//	answer text
 func transformThinkBlocks(content string) string {
-	const (
-		openTag  = "<think>"
-		closeTag = "</think>"
-	)
-
-	openIdx := strings.Index(content, openTag)
-	if openIdx < 0 {
-		return content
-	}
-
-	before := content[:openIdx]
-	after := content[openIdx+len(openTag):]
-
-	closeIdx := strings.Index(after, closeTag)
-	thinkClosed := closeIdx >= 0
-
-	var thinkContent, rest string
-	if thinkClosed {
-		thinkContent = after[:closeIdx]
-		rest = after[closeIdx+len(closeTag):]
-	} else {
-		thinkContent = after
-	}
-
-	thinkContent = strings.TrimSpace(thinkContent)
-
-	var result strings.Builder
-	result.WriteString(before)
-
-	if thinkContent == "" {
-		if !thinkClosed {
-			result.WriteString("> 💭 **思考中...**\n")
-			return result.String()
-		}
-		result.WriteString(strings.TrimLeft(rest, "\n"))
-		return result.String()
-	}
-
-	// Render each line as a blockquote
-	result.WriteString("> 💭 **思考过程**\n")
-	for _, line := range strings.Split(thinkContent, "\n") {
-		result.WriteString("> ")
-		result.WriteString(line)
-		result.WriteString("\n")
-	}
-
-	if thinkClosed {
-		rest = strings.TrimLeft(rest, "\n")
-		if rest != "" {
-			result.WriteString("\n---\n\n")
-			result.WriteString(rest)
-		}
-	}
-
-	return result.String()
+	return im.TransformThinkBlocks(content, im.MarkdownThinkStyle)
 }
 
 // EndStream disables streaming_mode and cleans up state.

@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	_ "github.com/duckdb/duckdb-go/v2"
 	esv7 "github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v8"
@@ -26,6 +28,7 @@ import (
 	"go.uber.org/dig"
 	"google.golang.org/grpc"
 	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
@@ -36,24 +39,32 @@ import (
 	neo4jRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/neo4j"
 	postgresRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/postgres"
 	qdrantRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/qdrant"
+	sqliteRetrieverRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/sqlite"
 	weaviateRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/weaviate"
 	"github.com/Tencent/WeKnora/internal/application/service"
-	chatpipline "github.com/Tencent/WeKnora/internal/application/service/chat_pipline"
+	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/application/service/llmcontext"
 	memoryService "github.com/Tencent/WeKnora/internal/application/service/memory"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
-	"github.com/Tencent/WeKnora/internal/application/service/web_search"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/database"
+	"github.com/Tencent/WeKnora/internal/datasource"
+	feishuConnector "github.com/Tencent/WeKnora/internal/datasource/connector/feishu"
+	notionConnector "github.com/Tencent/WeKnora/internal/datasource/connector/notion"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/handler/session"
 	imPkg "github.com/Tencent/WeKnora/internal/im"
+	"github.com/Tencent/WeKnora/internal/im/dingtalk"
 	"github.com/Tencent/WeKnora/internal/im/feishu"
+	"github.com/Tencent/WeKnora/internal/im/mattermost"
 	"github.com/Tencent/WeKnora/internal/im/slack"
+	"github.com/Tencent/WeKnora/internal/im/telegram"
+	"github.com/Tencent/WeKnora/internal/im/wechat"
 	"github.com/Tencent/WeKnora/internal/im/wecom"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
+	infra_web_search "github.com/Tencent/WeKnora/internal/infrastructure/web_search"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/mcp"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
@@ -136,6 +147,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewAgentShareRepository))
 	must(container.Provide(repository.NewTenantDisabledSharedAgentRepository))
 	must(container.Provide(service.NewWebSearchStateService))
+	must(container.Provide(repository.NewDataSourceRepository))
+	must(container.Provide(repository.NewSyncLogRepository))
 
 	// MCP manager for managing MCP client connections
 	logger.Debugf(ctx, "[Container] Registering MCP manager...")
@@ -156,11 +169,13 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewDatasetService))
 	must(container.Provide(service.NewEvaluationService))
 	must(container.Provide(service.NewUserService))
+	must(container.Provide(service.NewWeKnoraCloudService))
 
 	// Extract services - register individual extracters with names
 	must(container.Provide(service.NewChunkExtractService, dig.Name("chunkExtractor")))
 	must(container.Provide(service.NewDataTableSummaryService, dig.Name("dataTableSummary")))
 	must(container.Provide(service.NewImageMultimodalService, dig.Name("imageMultimodal")))
+	must(container.Provide(service.NewVideoMultimodalService, dig.Name("videoMultimodal")))
 
 	must(container.Provide(service.NewMessageService))
 	must(container.Provide(service.NewMCPServiceService))
@@ -169,9 +184,11 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	// Web search service (needed by AgentService)
 	logger.Debugf(ctx, "[Container] Registering web search registry and providers...")
-	must(container.Provide(web_search.NewRegistry))
+	must(container.Provide(infra_web_search.NewRegistry))
 	must(container.Invoke(registerWebSearchProviders))
+	must(container.Provide(repository.NewWebSearchProviderRepository))
 	must(container.Provide(service.NewWebSearchService))
+	must(container.Provide(service.NewWebSearchProviderService))
 
 	// Agent service layer (requires event bus, web search service)
 	// SessionService is passed as parameter to CreateAgentEngine method when creating AgentService
@@ -197,23 +214,30 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	// Chat pipeline components for processing chat requests
 	logger.Debugf(ctx, "[Container] Registering chat pipeline plugins...")
-	must(container.Provide(chatpipline.NewEventManager))
-	must(container.Invoke(chatpipline.NewPluginTracing))
-	must(container.Invoke(chatpipline.NewPluginSearch))
-	must(container.Invoke(chatpipline.NewPluginRerank))
-	must(container.Invoke(chatpipline.NewPluginMerge))
-	must(container.Invoke(chatpipline.NewPluginDataAnalysis))
-	must(container.Invoke(chatpipline.NewPluginIntoChatMessage))
-	must(container.Invoke(chatpipline.NewPluginChatCompletion))
-	must(container.Invoke(chatpipline.NewPluginChatCompletionStream))
-	must(container.Invoke(chatpipline.NewPluginStreamFilter))
-	must(container.Invoke(chatpipline.NewPluginFilterTopK))
-	must(container.Invoke(chatpipline.NewPluginRewrite))
-	must(container.Invoke(chatpipline.NewPluginLoadHistory))
-	must(container.Invoke(chatpipline.NewPluginExtractEntity))
-	must(container.Invoke(chatpipline.NewPluginSearchEntity))
-	must(container.Invoke(chatpipline.NewPluginSearchParallel))
-	must(container.Invoke(chatpipline.NewMemoryPlugin))
+
+	// Data source sync framework
+	logger.Debugf(ctx, "[Container] Registering data source sync framework...")
+	must(container.Provide(initConnectorRegistry))
+	must(container.Provide(datasource.NewScheduler))
+	must(container.Provide(service.NewDataSourceService))
+	must(container.Invoke(startDataSourceScheduler))
+	logger.Debugf(ctx, "[Container] Data source sync framework registered")
+	must(container.Provide(chatpipeline.NewEventManager))
+	must(container.Invoke(chatpipeline.NewPluginSearch))
+	must(container.Invoke(chatpipeline.NewPluginRerank))
+	must(container.Invoke(chatpipeline.NewPluginWebFetch))
+	must(container.Invoke(chatpipeline.NewPluginMerge))
+	must(container.Invoke(chatpipeline.NewPluginDataAnalysis))
+	must(container.Invoke(chatpipeline.NewPluginIntoChatMessage))
+	must(container.Invoke(chatpipeline.NewPluginChatCompletion))
+	must(container.Invoke(chatpipeline.NewPluginChatCompletionStream))
+	must(container.Invoke(chatpipeline.NewPluginFilterTopK))
+	must(container.Invoke(chatpipeline.NewPluginQueryUnderstand))
+	must(container.Invoke(chatpipeline.NewPluginLoadHistory))
+	must(container.Invoke(chatpipeline.NewPluginExtractEntity))
+	must(container.Invoke(chatpipeline.NewPluginSearchEntity))
+	must(container.Invoke(chatpipeline.NewPluginSearchParallel))
+	must(container.Invoke(chatpipeline.NewMemoryPlugin))
 	logger.Debugf(ctx, "[Container] Chat pipeline plugins registered")
 
 	// HTTP handlers layer
@@ -233,16 +257,20 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewSystemHandler))
 	must(container.Provide(handler.NewMCPServiceHandler))
 	must(container.Provide(handler.NewWebSearchHandler))
+	must(container.Provide(handler.NewWebSearchProviderHandler))
 	must(container.Provide(handler.NewCustomAgentHandler))
 	must(container.Provide(service.NewSkillService))
 	must(container.Provide(handler.NewSkillHandler))
 	must(container.Provide(handler.NewOrganizationHandler))
 
+	// Data source handler
+	must(container.Provide(handler.NewDataSourceHandler))
 	// IM integration
 	logger.Debugf(ctx, "[Container] Registering IM integration...")
 	must(container.Provide(imPkg.NewService))
 	must(container.Invoke(registerIMAdapterFactories))
 	must(container.Provide(handler.NewIMHandler))
+	must(container.Provide(handler.NewWeKnoraCloudHandler))
 	logger.Debugf(ctx, "[Container] HTTP handlers registered")
 
 	// Router configuration
@@ -330,11 +358,12 @@ func initContextStorage(redisClient *redis.Client) (llmcontext.ContextStorage, e
 func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 	var dialector gorm.Dialector
 	var migrateDSN string
+	var sqliteDBPath string
 	switch os.Getenv("DB_DRIVER") {
 	case "postgres":
 		// DSN for GORM (key-value format)
 		gormDSN := fmt.Sprintf(
-			"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+			"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s TimeZone=UTC",
 			os.Getenv("DB_HOST"),
 			os.Getenv("DB_PORT"),
 			os.Getenv("DB_USER"),
@@ -374,25 +403,30 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 			os.Getenv("DB_PORT"),
 			os.Getenv("DB_NAME"),
 		)
-	//case "sqlite":
-	//	dbPath := os.Getenv("DB_PATH")
-	//	if dbPath == "" {
-	//		dbPath = "./data/weknora.db"
-	//	}
-	//	if dir := filepath.Dir(dbPath); dir != "." && dir != "" {
-	//		if err := os.MkdirAll(dir, 0755); err != nil {
-	//			return nil, fmt.Errorf("failed to create SQLite data directory %s: %w", dir, err)
-	//		}
-	//	}
-	//	sqlite_vec.Auto()
-	//	dsn := dbPath + "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on"
-	//	dialector = sqlite.Open(dsn)
-	//	migrateDSN = "sqlite3://" + dbPath
-	//	logger.Infof(context.Background(), "DB Config: driver=sqlite path=%s", dbPath)
+	case "sqlite":
+		dbPath := os.Getenv("DB_PATH")
+		if dbPath == "" {
+			dbPath = "./data/weknora.db"
+		}
+		if dir := filepath.Dir(dbPath); dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return nil, fmt.Errorf("failed to create SQLite data directory %s: %w", dir, err)
+			}
+		}
+		sqlite_vec.Auto()
+		dsn := dbPath + "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on"
+		dialector = sqlite.Open(dsn)
+		sqliteDBPath = dbPath
+		migrateDSN = "sqlite3://" + dbPath
+		logger.Infof(context.Background(), "DB Config: driver=sqlite path=%s", dbPath)
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", os.Getenv("DB_DRIVER"))
 	}
-	db, err := gorm.Open(dialector, &gorm.Config{})
+	db, err := gorm.Open(dialector, &gorm.Config{
+		NowFunc: func() time.Time {
+			return time.Now().UTC()
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -416,6 +450,7 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 		autoRecover := os.Getenv("AUTO_RECOVER_DIRTY") != "false"
 		migrationOpts := database.MigrationOptions{
 			AutoRecoverDirty: autoRecover,
+			SQLiteDBPath:     sqliteDBPath,
 		}
 
 		// Run base migrations (all versioned migrations including embeddings)
@@ -475,6 +510,56 @@ func resolveStorageProviderPending(db *gorm.DB) {
 		logger.Warnf(context.Background(), "Failed to resolve __pending_env__ storage providers: %v", result.Error)
 	} else if result.RowsAffected > 0 {
 		logger.Infof(context.Background(), "Resolved %d knowledge bases with __pending_env__ storage provider → %s", result.RowsAffected, storageType)
+	}
+
+	// Reset any pending tasks left over from previous aborted runs (Lite App mode)
+	resetPendingTasks(db)
+}
+
+// resetPendingTasks resets the state of any knowledge items or sync logs stuck in processing
+// due to an unexpected application restart when using in-memory queues (Lite mode).
+func resetPendingTasks(db *gorm.DB) {
+	if os.Getenv("REDIS_ADDR") != "" {
+		return // Distributed queue (Asynq) will handle its own retries
+	}
+
+	// 1. Reset knowledge parsing tasks
+	result := db.Model(&types.Knowledge{}).
+		Where("parse_status IN ?", []string{types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusDeleting}).
+		Updates(map[string]interface{}{
+			"parse_status":  types.ParseStatusFailed,
+			"error_message": "Task interrupted due to application restart",
+		})
+	if result.Error != nil {
+		logger.Warnf(context.Background(), "Failed to reset pending knowledge tasks: %v", result.Error)
+	} else if result.RowsAffected > 0 {
+		logger.Infof(context.Background(), "Reset %d stuck knowledge parsing tasks to failed state", result.RowsAffected)
+	}
+
+	// 2. Reset knowledge summary tasks
+	resultSummary := db.Model(&types.Knowledge{}).
+		Where("summary_status IN ?", []string{types.SummaryStatusPending, types.SummaryStatusProcessing}).
+		Updates(map[string]interface{}{
+			"summary_status": types.SummaryStatusFailed,
+		})
+	if resultSummary.Error != nil {
+		logger.Warnf(context.Background(), "Failed to reset pending summary tasks: %v", resultSummary.Error)
+	} else if resultSummary.RowsAffected > 0 {
+		logger.Infof(context.Background(), "Reset %d stuck summary generation tasks to failed state", resultSummary.RowsAffected)
+	}
+
+	// 3. Reset data source sync tasks
+	resultSync := db.Model(&types.SyncLog{}).
+		Where("status IN ?", []string{types.SyncLogStatusRunning, "pending"}).
+		Updates(map[string]interface{}{
+			"status":        types.SyncLogStatusFailed,
+			"error_message": "Sync interrupted due to application restart",
+			"end_time":      time.Now(),
+		})
+	if resultSync.Error != nil {
+		logger.Warnf(context.Background(), "Failed to reset pending data source sync tasks: %v", resultSync.Error)
+	} else if resultSync.RowsAffected > 0 {
+		logger.Infof(context.Background(), "Reset %d stuck data source sync tasks to failed state", resultSync.RowsAffected)
 	}
 }
 
@@ -600,16 +685,16 @@ func initRetrieveEngineRegistry(db *gorm.DB, cfg *config.Config) (interfaces.Ret
 			log.Infof("Register postgres retrieve engine success")
 		}
 	}
-	//if slices.Contains(retrieveDriver, "sqlite") {
-	//	sqliteRepo := sqliteRetrieverRepo.NewSQLiteRetrieveEngineRepository(db)
-	//	if err := registry.Register(
-	//		retriever.NewKVHybridRetrieveEngine(sqliteRepo, types.SQLiteRetrieverEngineType),
-	//	); err != nil {
-	//		log.Errorf("Register sqlite retrieve engine failed: %v", err)
-	//	} else {
-	//		log.Infof("Register sqlite retrieve engine success")
-	//	}
-	//}
+	if slices.Contains(retrieveDriver, "sqlite") {
+		sqliteRepo := sqliteRetrieverRepo.NewSQLiteRetrieveEngineRepository(db)
+		if err := registry.Register(
+			retriever.NewKVHybridRetrieveEngine(sqliteRepo, types.SQLiteRetrieverEngineType),
+		); err != nil {
+			log.Errorf("Register sqlite retrieve engine failed: %v", err)
+		} else {
+			log.Infof("Register sqlite retrieve engine success")
+		}
+	}
 	if slices.Contains(retrieveDriver, "elasticsearch_v8") {
 		client, err := elasticsearch.NewTypedClient(elasticsearch.Config{
 			Addresses: []string{os.Getenv("ELASTICSEARCH_ADDR")},
@@ -928,22 +1013,16 @@ func NewDuckDB() (*sql.DB, error) {
 	return sqlDB, nil
 }
 
-// registerWebSearchProviders registers all web search providers to the registry
-func registerWebSearchProviders(registry *web_search.Registry) {
-	// Register DuckDuckGo provider
-	registry.Register(web_search.DuckDuckGoProviderInfo(), func() (interfaces.WebSearchProvider, error) {
-		return web_search.NewDuckDuckGoProvider()
-	})
-
-	// Register Google provider
-	registry.Register(web_search.GoogleProviderInfo(), func() (interfaces.WebSearchProvider, error) {
-		return web_search.NewGoogleProvider()
-	})
-
-	// Register Bing provider
-	registry.Register(web_search.BingProviderInfo(), func() (interfaces.WebSearchProvider, error) {
-		return web_search.NewBingProvider()
-	})
+// registerWebSearchProviders registers all web search provider types to the registry.
+// Each provider type is registered with its factory function that accepts parameters.
+// Provider instances are created on-demand when tenants configure them.
+func registerWebSearchProviders(registry *infra_web_search.Registry) {
+	registry.Register("duckduckgo", infra_web_search.NewDuckDuckGoProvider)
+	registry.Register("google", infra_web_search.NewGoogleProvider)
+	registry.Register("bing", infra_web_search.NewBingProvider)
+	registry.Register("tavily", infra_web_search.NewTavilyProvider)
+	registry.Register("ollama", infra_web_search.NewOllamaProvider)
+	registry.Register("baidu", infra_web_search.NewBaiduProvider)
 }
 
 // registerIMAdapterFactories registers adapter factories for each IM platform
@@ -980,6 +1059,7 @@ func registerIMAdapterFactories(imService *imPkg.Service) {
 				getString(creds, "token"),
 				getString(creds, "encoding_aes_key"),
 				corpAgentID,
+				getString(creds, "api_base_url"),
 			)
 			if err != nil {
 				return nil, nil, err
@@ -987,11 +1067,16 @@ func registerIMAdapterFactories(imService *imPkg.Service) {
 			return adapter, nil, nil
 
 		case "websocket":
-			client := wecom.NewLongConnClient(
+			client, err := wecom.NewLongConnClient(
 				getString(creds, "bot_id"),
 				getString(creds, "bot_secret"),
+				getString(creds, "ws_endpoint"),
+				getString(creds, "bot_name"),
 				msgHandler,
 			)
+			if err != nil {
+				return nil, nil, err
+			}
 
 			wsCtx, wsCancel := context.WithCancel(context.Background())
 			go func() {
@@ -1090,6 +1175,143 @@ func registerIMAdapterFactories(imService *imPkg.Service) {
 		}
 	})
 
+	// Register Telegram adapter factory
+	imService.RegisterAdapterFactory("telegram", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
+		creds, err := parseCredentials(channel.Credentials)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse telegram credentials: %w", err)
+		}
+
+		botToken := getString(creds, "bot_token")
+
+		mode := channel.Mode
+		if mode == "" {
+			mode = "websocket"
+		}
+
+		switch mode {
+		case "webhook":
+			secretToken := getString(creds, "secret_token")
+			adapter := telegram.NewWebhookAdapter(botToken, secretToken)
+			return adapter, nil, nil
+
+		case "websocket":
+			client := telegram.NewLongConnClient(botToken, msgHandler)
+
+			wsCtx, wsCancel := context.WithCancel(context.Background())
+			go func() {
+				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
+					logger.Errorf(context.Background(), "[IM] Telegram long polling stopped for channel %s: %v", channel.ID, err)
+				}
+			}()
+
+			adapter := telegram.NewAdapter(client, botToken)
+			return adapter, wsCancel, nil
+
+		default:
+			return nil, nil, fmt.Errorf("unsupported telegram mode: %s", mode)
+		}
+	})
+
+	// Register DingTalk adapter factory
+	imService.RegisterAdapterFactory("dingtalk", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
+		creds, err := parseCredentials(channel.Credentials)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse dingtalk credentials: %w", err)
+		}
+
+		clientID := getString(creds, "client_id")
+		clientSecret := getString(creds, "client_secret")
+		cardTemplateID := getString(creds, "card_template_id")
+
+		mode := channel.Mode
+		if mode == "" {
+			mode = "websocket"
+		}
+
+		switch mode {
+		case "webhook":
+			adapter := dingtalk.NewWebhookAdapter(clientID, clientSecret, cardTemplateID)
+			return adapter, nil, nil
+
+		case "websocket":
+			client := dingtalk.NewLongConnClient(clientID, clientSecret, msgHandler)
+
+			wsCtx, wsCancel := context.WithCancel(context.Background())
+			go func() {
+				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
+					logger.Errorf(context.Background(), "[IM] DingTalk stream stopped for channel %s: %v", channel.ID, err)
+				}
+			}()
+
+			adapter := dingtalk.NewAdapter(client, clientID, clientSecret, cardTemplateID)
+			return adapter, wsCancel, nil
+
+		default:
+			return nil, nil, fmt.Errorf("unsupported dingtalk mode: %s", mode)
+		}
+	})
+
+	// Register Mattermost adapter factory (outgoing webhook + REST API).
+	imService.RegisterAdapterFactory("mattermost", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
+		creds, err := parseCredentials(channel.Credentials)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse mattermost credentials: %w", err)
+		}
+
+		mode := channel.Mode
+		if mode == "" {
+			mode = "webhook"
+		}
+		if mode != "webhook" {
+			return nil, nil, fmt.Errorf("unsupported mattermost mode: %s (only webhook is supported)", mode)
+		}
+
+		siteURL := getString(creds, "site_url")
+		botToken := getString(creds, "bot_token")
+		outgoingToken := getString(creds, "outgoing_token")
+		botUserID := getString(creds, "bot_user_id")
+
+		if outgoingToken == "" {
+			return nil, nil, fmt.Errorf("mattermost outgoing_token is required")
+		}
+
+		client, err := mattermost.NewClient(siteURL, botToken)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		postReplyToMain := credentialBool(creds, "post_to_main")
+		adapter := mattermost.NewAdapter(client, outgoingToken, botUserID, postReplyToMain)
+		return adapter, func() {}, nil
+	})
+	// Register WeChat adapter factory
+	imService.RegisterAdapterFactory("wechat", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
+		creds, err := parseCredentials(channel.Credentials)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse wechat credentials: %w", err)
+		}
+
+		botToken := getString(creds, "bot_token")
+		ilinkBotID := getString(creds, "ilink_bot_id")
+
+		if botToken == "" || ilinkBotID == "" {
+			return nil, nil, fmt.Errorf("wechat credentials require bot_token and ilink_bot_id")
+		}
+
+		adapter := wechat.NewAdapter(botToken, ilinkBotID)
+		client := wechat.NewLongPollClient(botToken, ilinkBotID, msgHandler)
+
+		pollCtx, pollCancel := context.WithCancel(context.Background())
+		go func() {
+			if err := client.Start(pollCtx); err != nil && pollCtx.Err() == nil {
+				logger.Errorf(context.Background(), "[IM] WeChat long-poll stopped for channel %s: %v", channel.ID, err)
+			}
+		}()
+
+		return adapter, pollCancel, nil
+	})
+
 	// Load and start all enabled channels from database
 	if err := imService.LoadAndStartChannels(); err != nil {
 		logger.Warnf(ctx, "[IM] Failed to load channels from database: %v", err)
@@ -1116,4 +1338,55 @@ func getString(creds map[string]interface{}, key string) string {
 		}
 	}
 	return ""
+}
+
+// credentialBool reads a boolean from JSON credentials (bool, string "true"/"1", or non-zero number).
+func credentialBool(creds map[string]interface{}, key string) bool {
+	v, ok := creds[key]
+	if !ok {
+		return false
+	}
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		s := strings.TrimSpace(strings.ToLower(x))
+		return s == "true" || s == "1" || s == "yes"
+	case float64:
+		return x != 0
+	case int:
+		return x != 0
+	default:
+		return false
+	}
+}
+
+// initConnectorRegistry creates and populates the connector registry with all available connectors.
+func initConnectorRegistry() *datasource.ConnectorRegistry {
+	registry := datasource.NewConnectorRegistry()
+
+	// Register Feishu connector
+	_ = registry.Register(feishuConnector.NewConnector())
+
+	// Register Notion connector
+	_ = registry.Register(notionConnector.NewConnector())
+
+	// Future connectors will be registered here:
+	// _ = registry.Register(confluenceConnector.NewConnector())
+	// _ = registry.Register(yuqueConnector.NewConnector())
+	// _ = registry.Register(githubConnector.NewConnector())
+
+	return registry
+}
+
+// startDataSourceScheduler starts the data source cron scheduler and registers cleanup.
+func startDataSourceScheduler(scheduler *datasource.Scheduler, cleaner interfaces.ResourceCleaner) {
+	if err := scheduler.Start(context.Background()); err != nil {
+		logger.Warnf(context.Background(), "[Container] data source scheduler start failed: %v", err)
+	}
+
+	cleaner.RegisterWithName("DataSourceScheduler", func() error {
+		scheduler.Stop()
+		return nil
+	})
 }

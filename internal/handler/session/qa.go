@@ -36,6 +36,7 @@ type qaRequestContext struct {
 	effectiveTenantID uint64            // when using shared agent, tenant ID for model/KB/MCP resolution; 0 = use context tenant
 	images            []ImageAttachment // Uploaded images with analysis text
 	userMessageID     string            // Created user message ID (populated after createUserMessage)
+	channel           string            // Source channel: "web", "api", "im", etc.
 }
 
 // buildQARequest converts the qaRequestContext into a types.QARequest for service invocation.
@@ -80,6 +81,14 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 	if request.Query == "" {
 		logger.Error(ctx, "Query content is empty")
 		return nil, nil, errors.NewBadRequestError("Query content cannot be empty")
+	}
+
+	// SSRF protection: strip client-supplied URL/Caption fields from image attachments.
+	// The URL field must only be populated server-side by saveImageAttachments; an
+	// attacker could inject internal network URLs to trigger SSRF via the LLM provider.
+	for i := range request.Images {
+		request.Images[i].URL = ""
+		request.Images[i].Caption = ""
 	}
 
 	// Log request details
@@ -140,6 +149,7 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 			Role:        "assistant",
 			RequestID:   c.GetString(types.RequestIDContextKey.String()),
 			IsCompleted: false,
+			Channel:     request.Channel,
 		},
 		knowledgeBaseIDs:  secutils.SanitizeForLogArray(kbIDs),
 		knowledgeIDs:      secutils.SanitizeForLogArray(knowledgeIDs),
@@ -149,6 +159,7 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		mentionedItems:    convertMentionedItems(request.MentionedItems),
 		effectiveTenantID: effectiveTenantID,
 		images:            request.Images,
+		channel:           request.Channel,
 	}
 
 	return reqCtx, &request, nil
@@ -467,7 +478,7 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 	}
 
 	// Create user message
-	userMsg, err := h.createUserMessage(ctx, sessionID, reqCtx.query, reqCtx.requestID, reqCtx.mentionedItems, convertImageAttachments(reqCtx.images))
+	userMsg, err := h.createUserMessage(ctx, sessionID, reqCtx.query, reqCtx.requestID, reqCtx.mentionedItems, convertImageAttachments(reqCtx.images), reqCtx.channel)
 	if err != nil {
 		reqCtx.c.Error(errors.NewInternalServerError(err.Error()))
 		return

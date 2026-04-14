@@ -91,10 +91,10 @@ type CustomAgentConfig struct {
 	// ===== Agent Mode Settings =====
 	// Maximum iterations for ReAct loop (only for agent type)
 	MaxIterations int `yaml:"max_iterations" json:"max_iterations"`
+	// Timeout for a single LLM call in seconds (0 = use global default)
+	LLMCallTimeout int `yaml:"llm_call_timeout" json:"llm_call_timeout,omitempty"`
 	// Allowed tools (only for agent type)
 	AllowedTools []string `yaml:"allowed_tools" json:"allowed_tools"`
-	// Whether reflection is enabled (only for agent type)
-	ReflectionEnabled bool `yaml:"reflection_enabled" json:"reflection_enabled"`
 	// MCP service selection mode: "all" = all enabled MCP services, "selected" = specific services, "none" = no MCP
 	MCPSelectionMode string `yaml:"mcp_selection_mode" json:"mcp_selection_mode"`
 	// Selected MCP service IDs (only used when MCPSelectionMode is "selected")
@@ -143,6 +143,13 @@ type CustomAgentConfig struct {
 	WebSearchEnabled bool `yaml:"web_search_enabled" json:"web_search_enabled"`
 	// Maximum web search results
 	WebSearchMaxResults int `yaml:"web_search_max_results" json:"web_search_max_results"`
+	// WebSearchProviderID references a specific WebSearchProviderEntity.
+	// If empty, the tenant's default provider (is_default=true) is used.
+	WebSearchProviderID string `yaml:"web_search_provider_id" json:"web_search_provider_id,omitempty"`
+	// Whether to auto-fetch full page content for reranked web search results
+	WebFetchEnabled bool `yaml:"web_fetch_enabled" json:"web_fetch_enabled"`
+	// Max number of pages to fetch after rerank (default: 3)
+	WebFetchTopN int `yaml:"web_fetch_top_n" json:"web_fetch_top_n,omitempty"`
 
 	// ===== Multi-turn Conversation Settings =====
 	// Whether multi-turn conversation is enabled
@@ -177,6 +184,10 @@ type CustomAgentConfig struct {
 	FallbackResponse string `yaml:"fallback_response" json:"fallback_response"`
 	// Fallback prompt (when FallbackStrategy is "model")
 	FallbackPrompt string `yaml:"fallback_prompt" json:"fallback_prompt"`
+
+	// ===== Suggested Prompts =====
+	// 推荐问题列表，用于在前端对话面板展示快捷提问
+	SuggestedPrompts []string `yaml:"suggested_prompts" json:"suggested_prompts,omitempty"`
 }
 
 // Value implements driver.Valuer interface for CustomAgentConfig
@@ -236,9 +247,6 @@ func (a *CustomAgent) EnsureDefaults() {
 	if a.Config.RerankTopK == 0 {
 		a.Config.RerankTopK = 5
 	}
-	if a.Config.RerankThreshold == 0 {
-		a.Config.RerankThreshold = 0.5
-	}
 	// Advanced settings defaults
 	if a.Config.FallbackStrategy == "" {
 		a.Config.FallbackStrategy = "model"
@@ -255,6 +263,16 @@ func (a *CustomAgent) EnsureDefaults() {
 // IsAgentMode returns true if this agent uses ReAct agent mode
 func (a *CustomAgent) IsAgentMode() bool {
 	return a.Config.AgentMode == AgentModeSmartReasoning
+}
+
+// SuggestedQuestion 推荐问题
+type SuggestedQuestion struct {
+	// 问题文本
+	Question string `json:"question"`
+	// 来源类型: "faq", "document", "agent_config"
+	Source string `json:"source"`
+	// 来源知识库ID（仅 faq/document 来源时有值）
+	KnowledgeBaseID string `json:"knowledge_base_id,omitempty"`
 }
 
 // BuiltinAgentRegistry provides a registry of all built-in agents.

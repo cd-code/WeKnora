@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/models/provider"
@@ -26,17 +27,18 @@ type FunctionDef struct {
 
 // ChatOptions 聊天选项
 type ChatOptions struct {
-	Temperature         float64         `json:"temperature"`           // 温度参数
-	TopP                float64         `json:"top_p"`                 // Top P 参数
-	Seed                int             `json:"seed"`                  // 随机种子
-	MaxTokens           int             `json:"max_tokens"`            // 最大 token 数
-	MaxCompletionTokens int             `json:"max_completion_tokens"` // 最大完成 token 数
-	FrequencyPenalty    float64         `json:"frequency_penalty"`     // 频率惩罚
-	PresencePenalty     float64         `json:"presence_penalty"`      // 存在惩罚
-	Thinking            *bool           `json:"thinking"`              // 是否启用思考
-	Tools               []Tool          `json:"tools,omitempty"`       // 可用工具列表
-	ToolChoice          string          `json:"tool_choice,omitempty"` // "auto", "required", "none", or specific tool
-	Format              json.RawMessage `json:"format,omitempty"`      // 响应格式定义
+	Temperature         float64         `json:"temperature"`                   // 温度参数
+	TopP                float64         `json:"top_p"`                         // Top P 参数
+	Seed                int             `json:"seed"`                          // 随机种子
+	MaxTokens           int             `json:"max_tokens"`                    // 最大 token 数
+	MaxCompletionTokens int             `json:"max_completion_tokens"`         // 最大完成 token 数
+	FrequencyPenalty    float64         `json:"frequency_penalty"`             // 频率惩罚
+	PresencePenalty     float64         `json:"presence_penalty"`              // 存在惩罚
+	Thinking            *bool           `json:"thinking"`                      // 是否启用思考
+	Tools               []Tool          `json:"tools,omitempty"`               // 可用工具列表
+	ToolChoice          string          `json:"tool_choice,omitempty"`         // "auto", "required", "none", or specific tool
+	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"` // 是否允许并行工具调用（默认 nil 表示由模型决定）
+	Format              json.RawMessage `json:"format,omitempty"`              // 响应格式定义
 }
 
 // MessageContentPart represents a part of multi-content message
@@ -92,13 +94,15 @@ type Chat interface {
 }
 
 type ChatConfig struct {
-	Source    types.ModelSource
-	BaseURL   string
-	ModelName string
-	APIKey    string
-	ModelID   string
-	Provider  string
-	Extra     map[string]any
+	Source      types.ModelSource
+	BaseURL     string
+	ModelName   string
+	APIKey      string
+	ModelID     string
+	Provider    string
+	ExtraConfig map[string]string
+	AppID       string
+	AppSecret   string // 加密值，由工厂函数调用方传入，在 NewWeKnoraCloudChat 中使用前已解密
 }
 
 // NewChat 创建聊天实例
@@ -120,27 +124,25 @@ func NewRemoteChat(config *ChatConfig) (Chat, error) {
 		providerName = provider.DetectProvider(config.BaseURL)
 	}
 
-	switch providerName {
-	case provider.ProviderLKEAP:
-		// LKEAP 有特殊的 thinking 参数格式
-		return NewLKEAPChat(config)
-	case provider.ProviderAliyun:
-		// 检查是否为 Qwen3 模型（需要特殊处理 enable_thinking）
-		if provider.IsQwen3Model(config.ModelName) {
-			return NewQwenChat(config)
-		}
-		return NewRemoteAPIChat(config)
-	case provider.ProviderDeepSeek:
-		// DeepSeek 不支持 tool_choice
-		return NewDeepSeekChat(config)
-	case provider.ProviderGeneric:
-		// Generic provider (如 vLLM) 使用 ChatTemplateKwargs
-		return NewGenericChat(config)
-	case provider.ProviderNvidia:
-		// NVIDIA provider 使用BaseURL为请求地址
-		return NewNvidiaChat(config)
-	default:
-		// 其他 provider 使用标准 OpenAI 兼容实现
-		return NewRemoteAPIChat(config)
+	remoteChat, err := NewRemoteAPIChat(config)
+	if err != nil {
+		return nil, err
 	}
+
+	// Look up provider-specific behavior from spec registry
+	if spec := findProviderSpec(providerName, config.ModelName); spec != nil {
+		if spec.RequestCustomizer != nil {
+			remoteChat.SetRequestCustomizer(spec.RequestCustomizer)
+		}
+		if spec.EndpointCustomizer != nil {
+			remoteChat.SetEndpointCustomizer(spec.EndpointCustomizer)
+		}
+		if spec.HeaderCustomizer != nil {
+			remoteChat.SetHeaderCustomizer(func(req *http.Request, body []byte) error {
+				return spec.HeaderCustomizer(remoteChat, req, body)
+			})
+		}
+	}
+
+	return remoteChat, nil
 }

@@ -13,7 +13,9 @@ const (
 	TypeKnowledgeMove       = "knowledge:move"        // 知识移动任务
 	TypeDataTableSummary    = "datatable:summary"     // 表格摘要任务
 	TypeImageMultimodal     = "image:multimodal"      // 图片多模态处理任务（OCR + VLM Caption）
+	TypeVideoMultimodal     = "video:multimodal"      // 视频多模态处理任务（抽帧 + VLM + ASR）
 	TypeManualProcess       = "manual:process"        // 手工知识更新任务（cleanup + 重新索引）
+	TypeDataSourceSync      = "datasource:sync"       // 数据源同步任务
 )
 
 // ExtractChunkPayload represents the extract chunk task payload
@@ -38,6 +40,7 @@ type DocumentProcessPayload struct {
 	EnableMultimodel         bool     `json:"enable_multimodel"`
 	EnableQuestionGeneration bool     `json:"enable_question_generation"` // 是否启用问题生成
 	QuestionCount            int      `json:"question_count,omitempty"`   // 每个chunk生成的问题数量
+	Language                 string   `json:"language,omitempty"`         // Request locale for {{language}} in prompt templates
 }
 
 // FAQImportPayload represents the FAQ import task payload (including dry run mode)
@@ -60,6 +63,8 @@ type QuestionGenerationPayload struct {
 	KnowledgeBaseID string `json:"knowledge_base_id"`
 	KnowledgeID     string `json:"knowledge_id"`
 	QuestionCount   int    `json:"question_count"`
+	// Language is the request locale (e.g. zh-CN, en-US) when the task was enqueued, used for {{language}} / {{lang}} in templates.
+	Language string `json:"language,omitempty"`
 }
 
 // SummaryGenerationPayload represents the summary generation task payload
@@ -117,7 +122,7 @@ type KnowledgeMoveProgress struct {
 	SourceKBID string            `json:"source_kb_id"`
 	TargetKBID string            `json:"target_kb_id"`
 	Status     KBCloneTaskStatus `json:"status"`
-	Progress   int               `json:"progress"`  // 0-100
+	Progress   int               `json:"progress"`   // 0-100
 	Total      int               `json:"total"`      // 总知识数
 	Processed  int               `json:"processed"`  // 已处理数
 	Failed     int               `json:"failed"`     // 失败数
@@ -134,8 +139,8 @@ type ManualProcessPayload struct {
 	TenantID        uint64 `json:"tenant_id"`
 	KnowledgeID     string `json:"knowledge_id"`
 	KnowledgeBaseID string `json:"knowledge_base_id"`
-	Content         string `json:"content"`           // cleaned markdown content
-	NeedCleanup     bool   `json:"need_cleanup"`      // true for update, false for create
+	Content         string `json:"content"`      // cleaned markdown content
+	NeedCleanup     bool   `json:"need_cleanup"` // true for update, false for create
 }
 
 // ImageMultimodalPayload represents the image multimodal processing task payload.
@@ -143,11 +148,26 @@ type ImageMultimodalPayload struct {
 	TenantID        uint64 `json:"tenant_id"`
 	KnowledgeID     string `json:"knowledge_id"`
 	KnowledgeBaseID string `json:"knowledge_base_id"`
-	ChunkID         string `json:"chunk_id"`          // parent text chunk
-	ImageURL        string `json:"image_url"`          // provider:// URL (e.g. local://..., minio://...)
-	ImageLocalPath  string `json:"image_local_path"`   // deprecated: kept for backward compat with in-flight tasks
+	ChunkID         string `json:"chunk_id"`         // parent text chunk
+	ImageURL        string `json:"image_url"`        // provider:// URL (e.g. local://..., minio://...)
+	ImageLocalPath  string `json:"image_local_path"` // deprecated: kept for backward compat with in-flight tasks
 	EnableOCR       bool   `json:"enable_ocr"`
 	EnableCaption   bool   `json:"enable_caption"`
+	Language        string `json:"language,omitempty"` // Request locale for {{language}} in prompt templates
+}
+
+// VideoMultimodalPayload represents the video multimodal processing task payload.
+type VideoMultimodalPayload struct {
+	TenantID        uint64 `json:"tenant_id"`
+	KnowledgeID     string `json:"knowledge_id"`
+	KnowledgeBaseID string `json:"knowledge_base_id"`
+	ChunkID         string `json:"chunk_id"`             // parent text chunk
+	VideoURL        string `json:"video_url"`            // provider:// URL (e.g. local://..., minio://...)
+	VideoLocalPath  string `json:"video_local_path"`     // deprecated: kept for backward compat with in-flight tasks
+	EnableVLM       bool   `json:"enable_vlm"`           // enable VLM frame analysis
+	EnableASR       bool   `json:"enable_asr"`           // enable ASR audio transcription
+	Language        string `json:"language,omitempty"`   // Request locale for {{language}} in prompt templates
+	MaxFrames       int    `json:"max_frames,omitempty"` // optional: max frames to extract, 0 = no limit
 }
 
 // KBCloneTaskStatus represents the status of a knowledge base clone task

@@ -124,9 +124,10 @@ func buildStreamResponse(evt interfaces.StreamEvent, requestID string) *types.St
 						ChunkType:         getString(refMap, "chunk_type"),
 						ParentChunkID:     getString(refMap, "parent_chunk_id"),
 						ImageInfo:         getString(refMap, "image_info"),
-						KnowledgeFilename: getString(refMap, "knowledge_filename"),
-						KnowledgeSource:   getString(refMap, "knowledge_source"),
-						KnowledgeBaseID:   getString(refMap, "knowledge_base_id"),
+						KnowledgeFilename:    getString(refMap, "knowledge_filename"),
+						KnowledgeSource:      getString(refMap, "knowledge_source"),
+						KnowledgeDescription: getString(refMap, "knowledge_description"),
+						KnowledgeBaseID:      getString(refMap, "knowledge_base_id"),
 					}
 					searchResults = append(searchResults, sr)
 				}
@@ -165,7 +166,7 @@ func createAgentQueryEvent(sessionID, assistantMessageID string) interfaces.Stre
 }
 
 // createUserMessage creates a user message and returns the created message.
-func (h *Handler) createUserMessage(ctx context.Context, sessionID, query, requestID string, mentionedItems types.MentionedItems, images types.MessageImages) (*types.Message, error) {
+func (h *Handler) createUserMessage(ctx context.Context, sessionID, query, requestID string, mentionedItems types.MentionedItems, images types.MessageImages, channel string) (*types.Message, error) {
 	return h.messageService.CreateMessage(ctx, &types.Message{
 		SessionID:      sessionID,
 		Role:           "user",
@@ -175,6 +176,7 @@ func (h *Handler) createUserMessage(ctx context.Context, sessionID, query, reque
 		IsCompleted:    true,
 		MentionedItems: mentionedItems,
 		Images:         images,
+		Channel:        channel,
 	})
 }
 

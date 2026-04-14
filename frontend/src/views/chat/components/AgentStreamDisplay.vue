@@ -348,7 +348,7 @@ import { getChunkByIdOnly } from '@/api/knowledge-base';
 import { MessagePlugin } from 'tdesign-vue-next';
 import { useUIStore } from '@/stores/ui';
 import { useI18n } from 'vue-i18n';
-import { openMermaidFullscreen } from '@/utils/mermaidViewer';
+import i18n from '@/i18n';
 import { hydrateProtectedFileImages } from '@/utils/security';
 import {
   buildManualMarkdown,
@@ -357,7 +357,6 @@ import {
   replaceIncompleteImageWithPlaceholder,
 } from '@/utils/chatMessageShared';
 import {
-  bindMermaidFullscreenEvents,
   createMermaidCodeRenderer,
   ensureMermaidInitialized,
   renderMermaidInContainer,
@@ -418,32 +417,49 @@ const TOOL_NAME_KEYS: Record<string, string> = {
   knowledge_graph_extract: 'agentStream.tools.knowledgeGraphExtract',
   thinking: 'agentStream.tools.thinking',
   image_analysis: 'agentStream.tools.imageAnalysis',
+  query_knowledge_graph: 'agentStream.tools.queryKnowledgeGraph',
+  final_answer: 'agentStream.tools.finalAnswer',
+  read_skill: 'agentStream.tools.readSkill',
+  execute_skill_script: 'agentStream.tools.executeSkillScript',
+  data_analysis: 'agentStream.tools.dataAnalysis',
+  data_schema: 'agentStream.tools.dataSchema',
+  database_query: 'agentStream.tools.databaseQuery',
 };
 
 const getLocalizedToolName = (toolName?: string | null): string => {
   if (!toolName) return t('agent.toolFallback');
   const key = TOOL_NAME_KEYS[toolName];
-  return key ? t(key) : toolName;
+  if (key) return t(key);
+
+  // Format MCP tool names: "mcp_my_server_search_docs" → "My Server: search docs"
+  if (toolName.startsWith('mcp_')) {
+    return formatMCPToolName(toolName);
+  }
+
+  return toolName;
 };
 
-const TOOL_NAME_DISPLAY: Record<string, string> = {
-  knowledge_search: '语义搜索',
-  search_knowledge: '语义搜索',
-  grep_chunks: '文本搜索',
-  list_knowledge_chunks: '阅读文档内容',
-  get_document_info: '获取文档信息',
-  query_knowledge_graph: '知识图谱查询',
-  web_search: '网络搜索',
-  web_fetch: '网页抓取',
-  todo_write: '制定计划',
-  final_answer: '生成回答',
-  thinking: '思考',
-  read_skill: '读取技能',
-  execute_skill_script: '执行技能脚本',
-  data_analysis: '数据分析',
-  data_schema: '数据结构',
-  database_query: '数据库查询',
-  image_analysis: '查看图片内容',
+/**
+ * Format MCP tool name for friendly display.
+ * Input:  "mcp_{service_name}_{tool_name}" (all lowercase, underscores)
+ * Output: "Service Name: tool name"
+ */
+const formatMCPToolName = (rawName: string): string => {
+  // Strip "mcp_" prefix
+  const rest = rawName.slice(4);
+
+  // Try to find the tool's original name from the event's tool_data or description.
+  // Since we only have the sanitized composite name, split heuristically:
+  // The service name comes first, tool name second, separated by "_".
+  // We look for common MCP tool name patterns at the end.
+  const parts = rest.split('_');
+  if (parts.length <= 1) return rest;
+
+  // Heuristic: tool names from MCP servers are typically 1-3 words like
+  // "search", "get_weather", "list_bugs". We try to find a reasonable split.
+  // For now, treat everything as a readable phrase.
+  const humanized = parts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
+  return humanized;
 };
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
@@ -452,9 +468,14 @@ const ID_LABEL_RE = /\b(knowledge_base_id|knowledge_id|chunk_id|knowledge_base_i
 const sanitizeForDisplay = (text: string): string => {
   if (!text) return text;
   let result = text;
-  for (const [name, display] of Object.entries(TOOL_NAME_DISPLAY)) {
-    result = result.replaceAll(name, display);
+  for (const [name, i18nKey] of Object.entries(TOOL_NAME_KEYS)) {
+    result = result.replaceAll(name, i18n.global.t(i18nKey));
   }
+  // Format any remaining mcp_ tool names inline
+  result = result.replace(/\bmcp_([a-z0-9_]+)/g, (_match, rest) => {
+    const parts = rest.split('_');
+    return parts.map((p: string) => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
+  });
   result = result.replace(ID_LABEL_RE, '');
   result = result.replace(UUID_RE, '');
   result = result.replace(/`\s*`/g, '');
@@ -564,10 +585,7 @@ const props = defineProps<{
 }>();
 
 // Configure marked for security
-marked.use({
-  mangle: false,
-  headerIds: false
-});
+marked.use({});
 
 // Event stream
 const eventStream = computed(() => props.session?.agentEventStream || []);
@@ -822,18 +840,36 @@ const buildFullEventList = (stream: any[]) => {
     if (isThinkingLikeEvent(event) && result.length > 0) {
       const prev = result[result.length - 1];
       if (isThinkingLikeEvent(prev)) {
-        // Merge into previous: combine content
         const prevContent = prev._mergedContent || getThinkingContent(prev);
         const curContent = getThinkingContent(event);
+
+        // Deduplicate: when a tool_call thinking event's thought content was
+        // already delivered via streaming thinking events (same text), skip it.
+        if (curContent && prevContent && prevContent.includes(curContent)) {
+          continue;
+        }
+        if (curContent && prevContent && curContent.includes(prevContent)) {
+          // Current fully contains previous — replace instead of appending
+          result[result.length - 1] = {
+            type: 'thinking',
+            event_id: prev.event_id,
+            content: curContent,
+            thinking: prev.thinking || event.thinking,
+            timestamp: prev.timestamp,
+            _mergedContent: curContent,
+          };
+          continue;
+        }
+
+        // Normal merge: combine non-overlapping content
         const merged = [prevContent, curContent].filter(Boolean).join('\n\n');
-        // Replace previous with a merged thinking event
         result[result.length - 1] = {
           type: 'thinking',
           event_id: prev.event_id,
           content: merged,
           thinking: prev.thinking || event.thinking,
           timestamp: prev.timestamp,
-          _mergedContent: merged, // track for further merges
+          _mergedContent: merged,
         };
         continue;
       }
@@ -964,9 +1000,15 @@ const handleCitationActivate = (el: HTMLElement) => {
   const url = el.getAttribute('data-url');
   if (!url) return;
   try {
-    const newWindow = window.open(url, '_blank', 'noopener,noreferrer');
-    if (!newWindow) {
-      window.location.assign(url);
+    // @ts-ignore: Wails runtime check
+    if (window.runtime && window.runtime.BrowserOpenURL) {
+      // @ts-ignore
+      window.runtime.BrowserOpenURL(url);
+    } else {
+      const newWindow = window.open(url, '_blank', 'noopener,noreferrer');
+      if (!newWindow) {
+        window.location.assign(url);
+      }
     }
   } catch {
     window.location.assign(url);
@@ -1164,10 +1206,8 @@ const onRootClick = (e: Event) => {
   // Handle web citation clicks
   const webEl = target.closest?.('.citation-web') as HTMLElement | null;
   if (webEl && webEl.getAttribute('data-url')) {
-    if (!(webEl instanceof HTMLAnchorElement)) {
-      e.preventDefault();
-      handleCitationActivate(webEl);
-    }
+    e.preventDefault();
+    handleCitationActivate(webEl);
     return;
   }
   
@@ -1187,6 +1227,18 @@ const onRootClick = (e: Event) => {
     }
     return;
   }
+  
+  // Handle generic a clicks (especially in Wails desktop)
+  const aEl = target.closest?.('a') as HTMLAnchorElement | null;
+  // @ts-ignore
+  if (aEl && aEl.href && window.runtime && window.runtime.BrowserOpenURL) {
+    if (aEl.href.startsWith('http://') || aEl.href.startsWith('https://')) {
+      e.preventDefault();
+      // @ts-ignore
+      window.runtime.BrowserOpenURL(aEl.href);
+      return;
+    }
+  }
 };
 
 const onRootKeydown = (e: KeyboardEvent) => {
@@ -1197,15 +1249,8 @@ const onRootKeydown = (e: KeyboardEvent) => {
   const webEl = target.closest?.('.citation-web') as HTMLElement | null;
   if (webEl) {
     if (e.key === 'Enter' || e.key === ' ') {
-      if (webEl instanceof HTMLAnchorElement && e.key === 'Enter') {
-        return;
-      }
       e.preventDefault();
-      if (webEl instanceof HTMLAnchorElement) {
-        webEl.click();
-      } else {
-        handleCitationActivate(webEl);
-      }
+      handleCitationActivate(webEl);
     }
     return;
   }
@@ -1361,8 +1406,20 @@ const getTokens = (content: any) => {
     return `\x00TAG${idx}\x00`;
   });
 
-  let sanitized = sanitizeForDisplay(preserved);
+  // CRITICAL FIX: Also protect image URLs from sanitizeForDisplay
+  // Extract image markdown ![alt](url) before sanitization
+  const imagePlaceholders: string[] = [];
+  const preservedWithImages = preserved.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match) => {
+    const idx = imagePlaceholders.length;
+    imagePlaceholders.push(match);
+    return `\x00IMG${idx}\x00`;
+  });
 
+  let sanitized = sanitizeForDisplay(preservedWithImages);
+
+  // Restore preserved images
+  sanitized = sanitized.replace(/\x00IMG(\d+)\x00/g, (_, idx) => imagePlaceholders[Number(idx)]);
+  
   // Restore preserved tags
   sanitized = sanitized.replace(/\x00TAG(\d+)\x00/g, (_, idx) => tagPlaceholders[Number(idx)]);
 
@@ -1416,28 +1473,9 @@ const protectProviderImageSrcInHTML = (html: string): string => {
   );
 };
 
-// 已渲染的 mermaid 元素 ID 集合
-const renderedMermaidIds = new Set<string>();
-
 // 渲染 Mermaid 图表的函数
 const renderMermaidDiagrams = async () => {
-  try {
-    const renderedCount = await renderMermaidInContainer(rootElement.value, renderedMermaidIds);
-    if (renderedCount > 0) {
-      nextTick(() => {
-        bindMermaidClickEvents();
-      });
-    }
-  } catch (error) {
-    console.error('Mermaid rendering error:', error);
-  }
-};
-
-// 为 Mermaid 容器绑定点击全屏事件（绑定在 div 上，不是 SVG 上）
-const bindMermaidClickEvents = () => {
-  bindMermaidFullscreenEvents(rootElement.value, (svgOuterHTML: string) => {
-    openMermaidFullscreen(svgOuterHTML);
-  });
+  await renderMermaidInContainer(rootElement.value);
 };
 
 // Tool summary - extract key info to display externally
@@ -1566,6 +1604,8 @@ const getToolIcon = (toolName: string): string => {
     return fileAddIcon;
   } else if (toolName === 'image_analysis') {
     return thinkingIcon;
+  } else if (toolName.startsWith('mcp_')) {
+    return documentIcon; // MCP external tool icon
   } else {
     return documentIcon; // default icon
   }

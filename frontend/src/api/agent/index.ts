@@ -47,6 +47,7 @@ export interface CustomAgentConfig {
 
   // ===== 网络搜索设置 =====
   web_search_enabled?: boolean;
+  web_search_provider_id?: string;
   web_search_max_results?: number;
 
   // ===== 多轮对话设置 =====
@@ -182,11 +183,12 @@ export interface IMChannel {
   id: string;
   tenant_id?: number;
   agent_id: string;
-  platform: 'wecom' | 'feishu' | 'slack';
+  platform: 'wecom' | 'feishu' | 'slack' | 'telegram' | 'dingtalk' | 'mattermost' | 'wechat';
   name: string;
   enabled: boolean;
-  mode: 'webhook' | 'websocket';
+  mode: 'webhook' | 'websocket' | 'longpoll';
   output_mode: 'stream' | 'full';
+  session_mode?: 'user' | 'thread';
   knowledge_base_id?: string;
   credentials: Record<string, any>;
   created_at?: string;
@@ -211,4 +213,51 @@ export function deleteIMChannel(id: string) {
 
 export function toggleIMChannel(id: string) {
   return post<{ data: IMChannel }>(`/api/v1/im-channels/${id}/toggle`);
+}
+
+// ===== 推荐问题 =====
+
+// 推荐问题
+export interface SuggestedQuestion {
+  question: string;
+  source: 'faq' | 'document' | 'agent_config';
+  knowledge_base_id?: string;
+}
+
+// 获取智能体推荐问题
+// 根据智能体关联的知识库范围返回推荐问题，用于前端对话面板快捷提问
+export function getSuggestedQuestions(
+  agentId: string,
+  params?: { knowledge_base_ids?: string[]; knowledge_ids?: string[]; limit?: number }
+) {
+  const query = new URLSearchParams();
+  if (params?.knowledge_base_ids?.length) query.set('knowledge_base_ids', params.knowledge_base_ids.join(','));
+  if (params?.knowledge_ids?.length) query.set('knowledge_ids', params.knowledge_ids.join(','));
+  if (params?.limit) query.set('limit', String(params.limit));
+  const qs = query.toString();
+  return get<{ data: { questions: SuggestedQuestion[] } }>(`/api/v1/agents/${agentId}/suggested-questions${qs ? '?' + qs : ''}`);
+}
+// ===== WeChat QR Code Login =====
+
+export interface WeChatQRCodeResult {
+  qrcode_url: string;
+  qrcode: string;
+}
+
+export interface WeChatQRCodeStatus {
+  status: 'wait' | 'scaned' | 'confirmed' | 'expired';
+  credentials?: {
+    bot_token: string;
+    ilink_bot_id: string;
+    ilink_user_id: string;
+  };
+  baseurl?: string;
+}
+
+export function getWeChatQRCode() {
+  return post<{ data: WeChatQRCodeResult }>('/api/v1/wechat/qrcode');
+}
+
+export function pollWeChatQRCodeStatus(qrcode: string) {
+  return post<{ data: WeChatQRCodeStatus }>('/api/v1/wechat/qrcode/status', { qrcode });
 }

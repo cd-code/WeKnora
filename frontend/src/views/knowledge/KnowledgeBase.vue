@@ -42,6 +42,7 @@ const uploadInputRef = ref<HTMLInputElement | null>(null);
 const folderUploadInputRef = ref<HTMLInputElement | null>(null);
 const uploading = ref(false);
 const kbLoading = ref(false);
+const docListLoading = ref(true);
 const isFAQ = computed(() => (kbInfo.value?.type || '') === 'faq');
 const missingStorageEngine = computed(() => {
   if (!kbInfo.value || isFAQ.value) return false
@@ -167,6 +168,8 @@ const onVisibleChange = (visible: boolean) => {
 let isCardDetails = ref(false);
 let timeout: ReturnType<typeof setInterval> | null = null;
 let delDialog = ref(false)
+let rebuildDialog = ref(false)
+let rebuildKnowledgeItem = ref<KnowledgeCard>({ id: '', parse_status: '' })
 let knowledge = ref<KnowledgeCard>({ id: '', parse_status: '' })
 let knowledgeIndex = ref(-1)
 let knowledgeScroll = ref()
@@ -208,6 +211,18 @@ const fileTypeOptions = computed(() => [
   { content: 'MD', value: 'md' },
   { content: 'URL', value: 'url' },
   { content: t('knowledgeBase.typeManual'), value: 'manual' },
+    { content: 'MP4', value: 'mp4' },
+  { content: 'MOV', value: 'mov' },
+  { content: 'AVI', value: 'avi' },
+  { content: 'MKV', value: 'mkv' },
+  { content: 'WEBM', value: 'webm' },
+  { content: 'WMV', value: 'wmv' },
+  { content: 'FLV', value: 'flv' },
+  { content: 'MP3', value: 'mp3' },
+  { content: 'WAV', value: 'wav' },
+  { content: 'M4A', value: 'm4a' },
+  { content: 'FLAC', value: 'flac' },
+  { content: 'OGG', value: 'ogg' },
 ]);
 type TagInputInstance = ComponentPublicInstance<{ focus: () => void; select: () => void }>;
 const tagDropdownOptions = computed(() =>
@@ -277,6 +292,23 @@ const formatFileSize = (bytes?: number | string) => {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / (1024 * 1024)).toFixed(1)} MB`
 }
+
+const channelLabelMap: Record<string, string> = {
+  web: 'knowledgeBase.channelWeb',
+  api: 'knowledgeBase.channelApi',
+  browser_extension: 'knowledgeBase.channelBrowserExtension',
+  wechat: 'knowledgeBase.channelWechat',
+  wecom: 'knowledgeBase.channelWecom',
+  feishu: 'knowledgeBase.channelFeishu',
+  dingtalk: 'knowledgeBase.channelDingtalk',
+  slack: 'knowledgeBase.channelSlack',
+  im: 'knowledgeBase.channelIm',
+};
+
+const getChannelLabel = (channel: string) => {
+  const key = channelLabelMap[channel];
+  return key ? t(key) : t('knowledgeBase.channelUnknown');
+};
 
 // 获取知识条目的显示类型
 const getKnowledgeType = (item: any) => {
@@ -377,7 +409,10 @@ const handleTagRowClick = (tagId: string) => {
     editingTagId.value = null;
     editingTagName.value = '';
   }
-  if (selectedTagId.value === tagId) return;
+  if (selectedTagId.value === tagId) {
+    handleTagFilterChange('');
+    return;
+  }
   handleTagFilterChange(tagId);
 };
 
@@ -496,6 +531,7 @@ const confirmDeleteTag = (tag: any) => {
       loadTags(kbId.value);
       // 由于后端是异步删除文档，延迟刷新以确保看到最新数据
       setTimeout(() => {
+        page = 1; // Reset page counter when reloading files after tag deletion
         loadKnowledgeFiles(kbId.value);
       }, 500);
     })
@@ -510,6 +546,7 @@ const handleKnowledgeTagChange = async (knowledgeId: string, tagValue: string) =
     const tagIdToUpdate = tagValue || null;
     await updateKnowledgeTagBatch({ updates: { [knowledgeId]: tagIdToUpdate } });
     MessagePlugin.success(t('knowledgeBase.tagUpdateSuccess'));
+    page = 1; // Reset page counter to 1 when reloading files after tag change
     loadKnowledgeFiles(kbId.value);
     loadTags(kbId.value);
   } catch (error: any) {
@@ -530,6 +567,7 @@ const loadKnowledgeBaseInfo = async (targetKbId: string) => {
     // 重置store中的标签选择状态，避免上传文档时自动带上之前选择的标签
     uiStore.setSelectedTagId('');
     if (!isFAQ.value) {
+      docListLoading.value = true;
       loadKnowledgeFiles(targetKbId);
     } else {
       cardList.value = [];
@@ -632,6 +670,7 @@ const handleFileUploaded = (event: CustomEvent) => {
   if (uploadedKbId && uploadedKbId === kbId.value && !isFAQ.value) {
     console.log('匹配当前知识库，开始刷新文件列表');
     // 如果上传的文件属于当前知识库，使用 loadKnowledgeFiles 刷新文件列表
+    page = 1; // Reset page counter when reloading files after upload
     loadKnowledgeFiles(uploadedKbId);
     loadTags(uploadedKbId);
   }
@@ -686,6 +725,7 @@ onUnmounted(() => {
 });
 watch(() => cardList.value, (newValue) => {
   if (isFAQ.value) return;
+  docListLoading.value = false;
 
   // Auto-open document if navigated with ?knowledge_id=xxx
   if (pendingKnowledgeId.value && newValue?.length) {
@@ -857,6 +897,7 @@ const handleMoveConfirm = async () => {
       startMovePoll(taskId);
     } else {
       moveSubmitting.value = false;
+      page = 1; // Reset page counter when reloading files after move
       loadKnowledgeFiles(kbId.value);
     }
   } catch (e: any) {
@@ -881,6 +922,7 @@ const startMovePoll = (taskId: string) => {
         } else {
           MessagePlugin.success(t('knowledgeBase.moveCompleted'));
         }
+        page = 1; // Reset page counter when reloading files after move completion
         loadKnowledgeFiles(kbId.value);
       } else if (data.status === 'failed') {
         stopMovePoll();
@@ -902,6 +944,7 @@ const stopMovePoll = () => {
 
 const manualEditorSuccess = ({ kbId: savedKbId }: { kbId: string; knowledgeId: string; status: 'draft' | 'publish' }) => {
   if (savedKbId === kbId.value && !isFAQ.value) {
+    page = 1; // Reset page counter when reloading files after manual edit
     loadKnowledgeFiles(savedKbId);
   }
 };
@@ -1042,7 +1085,7 @@ const handleDocumentUpload = async (event: Event) => {
       failCount++;
       let errorMessage = error?.error?.message || error?.message || t('knowledgeBase.uploadFailed');
       if (error?.code === 'duplicate_file') {
-        errorMessage = "文件已存在";
+        errorMessage = t('knowledgeBase.fileExists');
       }
       if (totalCount === 1) {
         MessagePlugin.error(errorMessage);
@@ -1087,11 +1130,14 @@ const handleFolderUpload = async (event: Event) => {
   }
 
   const vlmEnabled = kbInfo.value?.vlm_config?.enabled || false;
+  const asrEnabled = kbInfo.value?.asr_config?.enabled || false;
   const dynamicTypes = supportedFileTypes.value.size > 0 ? supportedFileTypes.value : undefined
 
   const validFiles: File[] = [];
   let hiddenFileCount = 0;
   let imageFilteredCount = 0;
+  let videoFilteredCount = 0;
+  let audioFilteredCount = 0;
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -1104,13 +1150,25 @@ const handleFolderUpload = async (event: Event) => {
       continue;
     }
     
+    const fileExt = file.name.substring(file.name.lastIndexOf('.') + 1).toLowerCase();
+    const imageTypes = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
+    const videoTypes = ['mp4', 'mov', 'avi', 'mkv', 'webm', 'wmv', 'flv'];
+    const audioTypes = ['mp3', 'wav', 'm4a', 'flac', 'ogg'];
+    
     if (!vlmEnabled) {
-      const fileExt = file.name.substring(file.name.lastIndexOf('.') + 1).toLowerCase();
-      const imageTypes = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
       if (imageTypes.includes(fileExt)) {
         imageFilteredCount++;
         continue;
       }
+      if (videoTypes.includes(fileExt)) {
+        videoFilteredCount++;
+        continue;
+      }
+    }
+    
+    if (!asrEnabled && audioTypes.includes(fileExt)) {
+      audioFilteredCount++;
+      continue;
     }
     
     if (!kbFileTypeVerification(file, true, dynamicTypes)) {
@@ -1123,7 +1181,6 @@ const handleFolderUpload = async (event: Event) => {
     if (input) input.value = '';
     return;
   }
-
   MessagePlugin.info(t('knowledgeBase.uploadingFolder', { total: validFiles.length }));
 
   // 批量上传
@@ -1293,7 +1350,7 @@ const handleManualEdit = (index: number, item: KnowledgeCard) => {
   });
 };
 
-const handleKnowledgeReparse = async (index: number, item: KnowledgeCard) => {
+const handleKnowledgeReparse = (index: number, item: KnowledgeCard) => {
   if (isFAQ.value) return;
   if (!canEdit.value) return;
   if (!item?.id) {
@@ -1307,13 +1364,18 @@ const handleKnowledgeReparse = async (index: number, item: KnowledgeCard) => {
   if (cardList.value[index]) {
     cardList.value[index].isMore = false;
   }
-  const confirm = window.confirm(
-    t('knowledgeBase.rebuildConfirm', { fileName: item.file_name || item.title || '' }) as string,
-  );
-  if (!confirm) return;
+  rebuildKnowledgeItem.value = item;
+  rebuildDialog.value = true;
+};
+
+const rebuildConfirm = async () => {
+  rebuildDialog.value = false;
+  const item = rebuildKnowledgeItem.value;
+  if (!item?.id) return;
   try {
     await reparseKnowledge(item.id);
     MessagePlugin.success(t('knowledgeBase.rebuildSubmitted'));
+    page = 1; // Reset page counter when reloading files after reparse
     loadKnowledgeFiles(kbId.value);
   } catch (error: any) {
     MessagePlugin.error(error?.message || t('knowledgeBase.rebuildFailed'));
@@ -1342,6 +1404,7 @@ const delCardConfirm = () => {
   delDialog.value = false;
   delKnowledge(knowledgeIndex.value, knowledge.value, () => {
     // 删除成功后刷新文档列表和分类数量
+    page = 1; // Reset page counter when reloading files after deletion
     loadKnowledgeFiles(kbId.value);
     loadTags(kbId.value);
   });
@@ -1410,8 +1473,13 @@ async function createNewSession(value: string): Promise<void> {
                   :disabled="!kbId"
                   @click.stop="handleNavigateToCurrentKB"
                 >
-                  <span>{{ kbInfo?.name || '--' }}</span>
-                  <t-icon name="chevron-down" />
+                  <template v-if="!kbInfo">
+                    <t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '20px' }]" />
+                  </template>
+                  <template v-else>
+                    <span>{{ kbInfo.name }}</span>
+                    <t-icon name="chevron-down" />
+                  </template>
                 </button>
               </t-dropdown>
               <button
@@ -1421,13 +1489,18 @@ async function createNewSession(value: string): Promise<void> {
                 :disabled="!kbId"
                 @click="handleNavigateToCurrentKB"
               >
-                {{ kbInfo?.name || '--' }}
+                <template v-if="!kbInfo">
+                  <t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '20px' }]" />
+                </template>
+                <template v-else>
+                  {{ kbInfo.name }}
+                </template>
               </button>
               <t-icon name="chevron-right" class="breadcrumb-separator" />
               <span class="breadcrumb-current">{{ $t('knowledgeEditor.document.title') }}</span>
             </h2>
             <!-- 身份与最后更新：紧凑单行，置于标题行右侧，悬停显示权限说明 -->
-            <div v-if="kbInfo" class="kb-access-meta">
+            <div v-if="kbInfo && !authStore.isLiteMode" class="kb-access-meta">
               <t-tooltip :content="accessPermissionSummary" placement="top">
                 <span class="kb-access-meta-inner">
                   <t-tag size="small" :theme="isOwner ? 'success' : (effectiveKBPermission === 'admin' ? 'primary' : effectiveKBPermission === 'editor' ? 'warning' : 'default')" class="kb-access-role-tag">
@@ -1480,7 +1553,7 @@ async function createNewSession(value: string): Promise<void> {
         ref="uploadInputRef"
         type="file"
         class="document-upload-input"
-        :accept="acceptFileTypes || '.pdf,.docx,.doc,.txt,.md,.jpg,.jpeg,.png,.csv,.xlsx,.xls,.pptx,.ppt'"
+          :accept="acceptFileTypes || '.pdf,.docx,.doc,.txt,.md,.json,.jpg,.jpeg,.png,.csv,.xlsx,.xls,.pptx,.ppt,.mp3,.wav,.m4a,.flac,.ogg,.mp4,.mov,.avi,.mkv,.webm,.wmv,.flv'"
         multiple
         @change="handleDocumentUpload"
       />
@@ -1507,7 +1580,7 @@ async function createNewSession(value: string): Promise<void> {
                 :title="$t('knowledgeBase.tagCreateAction')"
                 @click="startCreateTag"
               >
-                <span class="create-tag-plus" aria-hidden="true">+</span>
+                <t-icon name="add" />
               </t-button>
             </div>
           </div>
@@ -1523,11 +1596,18 @@ async function createNewSession(value: string): Promise<void> {
               </template>
             </t-input>
           </div>
-          <t-loading :loading="tagLoading" size="small">
-            <div class="tag-list">
+          <div class="tag-list">
+            <template v-if="tagLoading && !filteredTags.length">
+              <div v-for="n in 8" :key="'skel-tag-'+n" class="tag-list-item" style="cursor: default; pointer-events: none;">
+                <div class="tag-list-left" style="gap: 12px; width: 100%;">
+                  <t-skeleton animation="gradient" :row-col="[{ width: '80%', height: '18px' }]" />
+                </div>
+              </div>
+            </template>
+            <template v-else>
               <div v-if="creatingTag" class="tag-list-item tag-editing" @click.stop>
                 <div class="tag-list-left">
-                  <t-icon name="folder" size="18px" />
+                  <span class="tag-hash-icon">#</span>
                   <div class="tag-edit-input">
                     <t-input
                       ref="newTagInputRef"
@@ -1572,7 +1652,7 @@ async function createNewSession(value: string): Promise<void> {
                   @click="handleTagRowClick(tag.id)"
                 >
                   <div class="tag-list-left">
-                    <t-icon name="folder" size="18px" />
+                    <span class="tag-hash-icon">#</span>
                     <template v-if="editingTagId === tag.id">
                       <div class="tag-edit-input" @click.stop>
                         <t-input
@@ -1651,8 +1731,8 @@ async function createNewSession(value: string): Promise<void> {
                   {{ $t('tenant.loadMore') }}
                 </t-button>
               </div>
-            </div>
-          </t-loading>
+            </template>
+          </div>
         </aside>
         <div class="tag-content">
           <div class="doc-card-area">
@@ -1698,8 +1778,22 @@ async function createNewSession(value: string): Promise<void> {
               ref="knowledgeScroll"
               @scroll="handleScroll"
             >
-              <template v-if="cardList.length">
-                <div class="doc-card-list">
+              <!-- 文档骨架屏 -->
+              <div v-if="docListLoading && cardList.length === 0" class="doc-card-list doc-card-list-animated">
+                <div v-for="n in 8" :key="'doc-skel-'+n" class="knowledge-card knowledge-card-skeleton">
+                  <div class="card-content">
+                    <div class="card-content-nav">
+                      <t-skeleton animation="gradient" :row-col="[{ width: '70%', height: '18px' }]" />
+                    </div>
+                    <t-skeleton animation="gradient" :row-col="[{ width: '100%', height: '14px' }, { width: '60%', height: '14px' }]" />
+                  </div>
+                  <div class="card-bottom">
+                    <t-skeleton animation="gradient" :row-col="[[{ width: '80px', height: '14px' }, { width: '40px', height: '18px', type: 'rect' }]]" />
+                  </div>
+                </div>
+              </div>
+              <template v-else-if="cardList.length">
+                <div class="doc-card-list doc-card-list-animated">
                   <!-- 现有文档卡片 -->
                   <div
                     class="knowledge-card"
@@ -1728,7 +1822,7 @@ async function createNewSession(value: string): Promise<void> {
                             @click.stop="openMore(index)"
                             :class="[moreIndex == index ? 'active-more' : '']"
                           >
-                            <img class="more" src="@/assets/img/more.png" alt="" />
+                            <img class="more-icon" src="@/assets/img/more.png" alt="" />
                           </div>
                           <template #content>
                             <!-- Normal menu -->
@@ -1909,6 +2003,7 @@ async function createNewSession(value: string): Promise<void> {
                       </template>
                       <div class="card-popover-meta">
                         <span class="card-popover-time">{{ t('knowledgeBase.updatedAt') }}：{{ formatDocTime(hoveredCardItem.updated_at) }}</span>
+                        <span v-if="(hoveredCardItem as any).channel && (hoveredCardItem as any).channel !== 'web'" class="card-popover-channel">{{ getChannelLabel((hoveredCardItem as any).channel) }}</span>
                         <span v-if="getTagName(hoveredCardItem.tag_id)" class="card-popover-tag">{{ getTagName(hoveredCardItem.tag_id) }}</span>
                         <span class="card-popover-type">{{ getKnowledgeType(hoveredCardItem) }}</span>
                       </div>
@@ -1917,7 +2012,7 @@ async function createNewSession(value: string): Promise<void> {
                   </div>
                 </Teleport>
               </template>
-              <template v-else>
+              <template v-else-if="!docListLoading">
                 <div class="doc-empty-state">
                   <EmptyKnowledge />
                 </div>
@@ -1943,6 +2038,31 @@ async function createNewSession(value: string): Promise<void> {
                 <span class="circle-btn-txt" @click="delDialog = false">{{ t('common.cancel') }}</span>
                 <span class="circle-btn-txt confirm" @click="delCardConfirm">
                   {{ t('knowledgeBase.confirmDelete') }}
+                </span>
+              </div>
+            </div>
+          </t-dialog>
+
+          <!-- 重建知识确认弹窗 -->
+          <t-dialog
+            v-model:visible="rebuildDialog"
+            dialogClassName="del-knowledge"
+            :closeBtn="false"
+            :cancelBtn="null"
+            :confirmBtn="null"
+          >
+            <div class="circle-wrap">
+              <div class="header">
+                <img class="circle-img" src="@/assets/img/circle.png" alt="" />
+                <span class="circle-title">{{ t('knowledgeBase.rebuildDocument') }}</span>
+              </div>
+              <span class="del-circle-txt">
+                {{ t('knowledgeBase.rebuildConfirm', { fileName: rebuildKnowledgeItem.file_name || rebuildKnowledgeItem.title || '' }) }}
+              </span>
+              <div class="circle-btn">
+                <span class="circle-btn-txt" @click="rebuildDialog = false">{{ t('common.cancel') }}</span>
+                <span class="circle-btn-txt confirm" @click="rebuildConfirm">
+                  {{ t('common.confirm') }}
                 </span>
               </div>
             </div>
@@ -2018,19 +2138,18 @@ async function createNewSession(value: string): Promise<void> {
   display: flex;
   flex: 1;
   min-height: 0;
-  background: var(--td-bg-color-container);
-  border: 1px solid var(--td-component-stroke);
-  border-radius: 10px;
-  overflow: hidden;
+  background: transparent;
+  border: none;
 }
 
-// 与列表页筛选区一致：白底卡片感、细分界
+// 贴近整体系统设计语言的极简侧栏（对齐 menu 与右侧主窗口质感）
 .tag-sidebar {
-  width: 200px;
-  background: var(--td-bg-color-container);
+  width: 180px;
+  background: transparent;
+  border: none;
   border-right: 1px solid var(--td-component-stroke);
-  box-shadow: 2px 0 8px rgba(0, 0, 0, 0.04);
-  padding: 16px;
+  box-shadow: 1px 0 0 rgba(0, 0, 0, 0.02);
+  padding: 0 16px 0 0;
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
@@ -2041,62 +2160,71 @@ async function createNewSession(value: string): Promise<void> {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
+    padding: 0 4px;
     color: var(--td-text-color-primary);
 
     .sidebar-title {
       display: flex;
       align-items: baseline;
-      gap: 4px;
-      font-size: 13px;
+      gap: 6px;
+      font-size: 14px;
       font-weight: 600;
+      letter-spacing: 0.5px;
 
       .sidebar-count {
         font-size: 12px;
-        color: var(--td-text-color-secondary);
+        color: var(--td-text-color-placeholder);
+        font-weight: 400;
       }
     }
 
     .sidebar-actions {
       display: flex;
       gap: 6px;
-      color: var(--td-text-color-placeholder);
       align-items: center;
 
       .create-tag-btn {
         width: 24px;
         height: 24px;
         padding: 0;
-        border-radius: 6px;
+        border-radius: 4px;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 16px;
-        font-weight: 600;
-        color: var(--td-success-color);
-        line-height: 1;
-        transition: background 0.2s ease, color 0.2s ease;
+        color: var(--td-text-color-secondary);
+        transition: all 0.2s ease;
+
+        .t-icon {
+          font-size: 16px;
+        }
 
         &:hover {
           background: var(--td-bg-color-secondarycontainer);
-          color: var(--td-brand-color-active);
+          color: var(--td-brand-color);
         }
-      }
-
-      .create-tag-plus {
-        line-height: 1;
       }
     }
   }
 
   .tag-search-bar {
-    margin-bottom: 10px;
+    margin-bottom: 12px;
+    padding: 0 4px;
 
     :deep(.t-input) {
       font-size: 13px;
-      background-color: var(--td-bg-color-container);
-      border-color: var(--td-component-stroke);
+      background-color: var(--td-bg-color-secondarycontainer);
+      border-color: transparent;
       border-radius: 6px;
+      box-shadow: none !important;
+
+      &:hover,
+      &:focus,
+      &.t-is-focused {
+        border-color: var(--td-brand-color);
+        background-color: var(--td-bg-color-container);
+        box-shadow: none !important;
+      }
     }
   }
 
@@ -2130,13 +2258,13 @@ async function createNewSession(value: string): Promise<void> {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 9px 12px;
+      padding: 8px 8px;
       border-radius: 6px;
       color: var(--td-text-color-primary);
       cursor: pointer;
       transition: all 0.2s ease;
       font-family: "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
-      font-size: 14px;
+      font-size: 13px;
       -webkit-font-smoothing: antialiased;
 
       .tag-list-left {
@@ -2146,11 +2274,24 @@ async function createNewSession(value: string): Promise<void> {
         min-width: 0;
         flex: 1;
 
-        .t-icon {
+        .t-icon,
+        .tag-hash-icon {
           flex-shrink: 0;
           color: var(--td-text-color-secondary);
-          font-size: 14px;
           transition: color 0.2s ease;
+        }
+
+        .t-icon {
+          font-size: 16px;
+        }
+
+        .tag-hash-icon {
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+          font-size: 16px;
+          font-weight: 500;
+          width: 16px;
+          text-align: center;
+          display: inline-block;
         }
       }
 
@@ -2161,10 +2302,9 @@ async function createNewSession(value: string): Promise<void> {
         text-overflow: ellipsis;
         white-space: nowrap;
         font-family: "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
-        font-size: 14px;
-        font-weight: 450;
+        font-size: 13px;
+        font-weight: 400;
         line-height: 1.4;
-        letter-spacing: 0.01em;
       }
 
       .tag-list-right {
@@ -2177,37 +2317,34 @@ async function createNewSession(value: string): Promise<void> {
 
       .tag-count {
         font-size: 12px;
-        color: var(--td-text-color-secondary);
-        font-weight: 500;
-        min-width: 28px;
-        padding: 3px 7px;
-        border-radius: 8px;
-        background: var(--td-bg-color-secondarycontainer);
+        color: var(--td-text-color-placeholder);
+        font-weight: 400;
         transition: all 0.2s ease;
-        text-align: center;
-        box-sizing: border-box;
+        text-align: right;
+        padding-left: 8px;
+        background: transparent;
       }
 
       &:hover {
         background: var(--td-bg-color-secondarycontainer);
         color: var(--td-text-color-primary);
 
-        .tag-list-left .t-icon {
-          color: var(--td-text-color-primary);
+        .tag-list-left .t-icon,
+        .tag-list-left .tag-hash-icon {
+          color: var(--td-text-color-secondary);
         }
 
         .tag-count {
-          background: var(--td-bg-color-secondarycontainer);
-          color: var(--td-text-color-primary);
+          color: var(--td-text-color-secondary);
         }
       }
 
       &.active {
-        background: var(--td-success-color-light);
+        background: var(--td-brand-color-light);
         color: var(--td-brand-color);
-        font-weight: 500;
 
-        .tag-list-left .t-icon {
+        .tag-list-left .t-icon,
+        .tag-list-left .tag-hash-icon {
           color: var(--td-brand-color);
         }
 
@@ -2216,9 +2353,7 @@ async function createNewSession(value: string): Promise<void> {
         }
 
         .tag-count {
-          background: var(--td-success-color-light);
           color: var(--td-brand-color);
-          font-weight: 600;
         }
       }
 
@@ -2262,22 +2397,22 @@ async function createNewSession(value: string): Promise<void> {
         }
 
         :deep(.tag-action-btn.confirm) {
-          background: var(--td-success-color-light);
-          color: var(--td-brand-color-active);
-
-          &:hover {
-            background: var(--td-success-color-light);
-            color: var(--td-success-color);
-          }
-        }
-
-        :deep(.tag-action-btn.cancel) {
-          background: var(--td-bg-color-secondarycontainer);
+          background: transparent;
           color: var(--td-text-color-secondary);
 
           &:hover {
             background: var(--td-bg-color-secondarycontainer);
-            color: var(--td-text-color-secondary);
+            color: var(--td-brand-color);
+          }
+        }
+
+        :deep(.tag-action-btn.cancel) {
+          background: transparent;
+          color: var(--td-text-color-secondary);
+
+          &:hover {
+            background: var(--td-bg-color-secondarycontainer);
+            color: var(--td-error-color);
           }
         }
       }
@@ -2288,48 +2423,38 @@ async function createNewSession(value: string): Promise<void> {
         max-width: 100%;
 
         :deep(.t-input) {
-          font-size: 12px;
+          font-size: 13px;
           background-color: transparent;
           border: none;
-          border-bottom: 1px solid var(--td-component-stroke);
           border-radius: 0;
           box-shadow: none;
-          padding-left: 0;
-          padding-right: 0;
+          padding: 0;
         }
 
         :deep(.t-input__wrap) {
           background-color: transparent;
           border: none;
-          border-bottom: 1px solid var(--td-component-stroke);
           border-radius: 0;
           box-shadow: none;
         }
 
         :deep(.t-input__inner) {
-          padding-left: 0;
-          padding-right: 0;
+          padding: 0;
           color: var(--td-text-color-primary);
-          caret-color: var(--td-text-color-primary);
+          caret-color: var(--td-brand-color);
         }
 
         :deep(.t-input:hover),
         :deep(.t-input.t-is-focused),
         :deep(.t-input__wrap:hover),
         :deep(.t-input__wrap.t-is-focused) {
-          border-bottom-color: var(--td-success-color);
+          border-color: transparent;
         }
       }
 
       .tag-more {
         display: flex;
         align-items: center;
-        opacity: 0;
-        transition: opacity 0.2s ease;
-      }
-
-      &:hover .tag-more {
-        opacity: 1;
       }
 
       .tag-more-btn {
@@ -2339,7 +2464,7 @@ async function createNewSession(value: string): Promise<void> {
         align-items: center;
         justify-content: center;
         border-radius: 4px;
-        color: var(--td-text-color-secondary);
+        color: var(--td-text-color-placeholder);
         transition: all 0.2s ease;
 
         &:hover {
@@ -2353,7 +2478,7 @@ async function createNewSession(value: string): Promise<void> {
       text-align: center;
       padding: 10px 6px;
       color: var(--td-text-color-placeholder);
-      font-size: 11px;
+      font-size: 12px;
     }
   }
 }
@@ -2404,9 +2529,10 @@ async function createNewSession(value: string): Promise<void> {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: 12px;
+  padding: 0 0 0 16px;
+  border: none;
   overflow: hidden;
-  background: var(--td-bg-color-container);
+  background: transparent;
 }
 
 .doc-card-area {
@@ -2448,29 +2574,33 @@ async function createNewSession(value: string): Promise<void> {
 
   :deep(.t-input) {
     font-size: 13px;
-    background-color: var(--td-bg-color-container);
-    border-color: var(--td-component-stroke);
+    background-color: var(--td-bg-color-secondarycontainer);
+    border-color: transparent;
     border-radius: 6px;
+    box-shadow: none !important;
 
     &:hover,
     &:focus,
     &.t-is-focused {
       border-color: var(--td-brand-color);
       background-color: var(--td-bg-color-container);
+      box-shadow: none !important;
     }
   }
 
   :deep(.t-select) {
     .t-input {
       font-size: 13px;
-      background-color: var(--td-bg-color-container);
-      border-color: var(--td-component-stroke);
+      background-color: var(--td-bg-color-secondarycontainer);
+      border-color: transparent;
       border-radius: 6px;
+      box-shadow: none !important;
 
       &:hover,
       &.t-is-focused {
         border-color: var(--td-brand-color);
         background-color: var(--td-bg-color-container);
+        box-shadow: none !important;
       }
     }
   }
@@ -2812,6 +2942,11 @@ async function createNewSession(value: string): Promise<void> {
   }
 }
 
+@keyframes contentFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 .doc-card-list {
   box-sizing: border-box;
   display: grid;
@@ -2819,6 +2954,29 @@ async function createNewSession(value: string): Promise<void> {
   gap: 14px;
   align-content: flex-start;
   width: 100%;
+
+  &.doc-card-list-animated {
+    animation: contentFadeIn 0.32s ease-out;
+  }
+}
+
+.knowledge-card-skeleton {
+  cursor: default;
+  .card-content { padding: 15px 17px 13px; }
+  .card-content-nav { margin-bottom: 14px; }
+  .card-bottom {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    padding: 0 17px;
+    box-sizing: border-box;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid var(--td-component-stroke);
+  }
 }
 
 .doc-empty-state {
@@ -3179,7 +3337,7 @@ async function createNewSession(value: string): Promise<void> {
     background: var(--td-component-stroke);
   }
 
-  .more {
+  .more-icon {
     width: 14px;
     height: 14px;
   }
@@ -3342,6 +3500,13 @@ async function createNewSession(value: string): Promise<void> {
     gap: 8px;
     font-size: 11px;
     color: var(--td-text-color-secondary);
+  }
+
+  .card-popover-channel {
+    padding: 1px 6px;
+    background: var(--td-warning-color-light);
+    color: var(--td-warning-color);
+    border-radius: 4px;
   }
 
   .card-popover-tag {

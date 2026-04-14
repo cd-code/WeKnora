@@ -120,12 +120,18 @@ type SearchResult struct {
 	// Used to indicate the source of the knowledge, such as "url"
 	KnowledgeSource string `json:"knowledge_source"`
 
+	// KnowledgeChannel indicates through which channel the knowledge was ingested (web, api, wechat, etc.)
+	KnowledgeChannel string `json:"knowledge_channel"`
+
 	// ChunkMetadata stores chunk-level metadata (e.g., generated questions)
 	ChunkMetadata JSON `json:"chunk_metadata,omitempty"`
 
 	// MatchedContent is the actual content that was matched in vector search
 	// For FAQ: this is the matched question text (standard or similar question)
 	MatchedContent string `json:"matched_content,omitempty"`
+
+	// KnowledgeDescription is the description of the knowledge document
+	KnowledgeDescription string `json:"knowledge_description,omitempty"`
 
 	// KnowledgeBaseID is the ID of the knowledge base this result belongs to
 	KnowledgeBaseID string `json:"knowledge_base_id,omitempty"`
@@ -175,7 +181,7 @@ type Pagination struct {
 	// Page
 	Page int `form:"page"      json:"page"      binding:"omitempty,min=1"`
 	// Page size
-	PageSize int `form:"page_size" json:"page_size" binding:"omitempty,min=1,max=100"`
+	PageSize int `form:"page_size" json:"page_size" binding:"omitempty,min=1,max=1000"`
 }
 
 // GetPage gets the page number, default is 1
@@ -191,8 +197,8 @@ func (p *Pagination) GetPageSize() int {
 	if p.PageSize < 1 {
 		return 20
 	}
-	if p.PageSize > 100 {
-		return 100
+	if p.PageSize > 1000 {
+		return 1000
 	}
 	return p.PageSize
 }

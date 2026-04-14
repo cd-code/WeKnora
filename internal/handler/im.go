@@ -11,6 +11,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// validIMPlatforms is the set of supported IM platforms.
+var validIMPlatforms = map[string]bool{
+	"wecom": true, "feishu": true, "slack": true, "telegram": true, "dingtalk": true, "mattermost": true,
+	"wechat": true,
+}
+
 // IMHandler handles IM platform callback requests and channel CRUD.
 type IMHandler struct {
 	imService *im.Service
@@ -40,21 +46,21 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 	}
 
 	var req struct {
-		Platform        string         `json:"platform" binding:"required"`
-		Name            string         `json:"name"`
-		Mode            string         `json:"mode"`
-		OutputMode      string         `json:"output_mode"`
-		KnowledgeBaseID string         `json:"knowledge_base_id"`
-		Credentials     types.JSON     `json:"credentials"`
-		Enabled         *bool          `json:"enabled"`
+		Platform        string     `json:"platform" binding:"required"`
+		Name            string     `json:"name"`
+		Mode            string     `json:"mode"`
+		OutputMode      string     `json:"output_mode"`
+		KnowledgeBaseID string     `json:"knowledge_base_id"`
+		Credentials     types.JSON `json:"credentials"`
+		Enabled         *bool      `json:"enabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if req.Platform != "wecom" && req.Platform != "feishu" && req.Platform != "slack" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "platform must be 'wecom', 'feishu' or 'slack'"})
+	if !validIMPlatforms[req.Platform] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "platform must be 'wecom', 'feishu', 'slack', 'telegram', 'dingtalk', 'mattermost' or 'wechat'"})
 		return
 	}
 
@@ -72,11 +78,21 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 	if req.Enabled != nil {
 		channel.Enabled = *req.Enabled
 	}
-	if channel.Mode == "" {
-		channel.Mode = "websocket"
-	}
-	if channel.OutputMode == "" {
-		channel.OutputMode = "stream"
+	// WeChat uses long-polling mode and full output only
+	if req.Platform == "wechat" {
+		channel.Mode = "longpoll"
+		channel.OutputMode = "full"
+	} else {
+		if channel.Mode == "" {
+			if channel.Platform == "mattermost" {
+				channel.Mode = "webhook"
+			} else {
+				channel.Mode = "websocket"
+			}
+		}
+		if channel.OutputMode == "" {
+			channel.OutputMode = "stream"
+		}
 	}
 	if channel.Credentials == nil {
 		channel.Credentials = types.JSON("{}")
@@ -262,6 +278,8 @@ func (h *IMHandler) IMCallback(c *gin.Context) {
 		return
 	}
 
+	logger.Infof(ctx, "[IM] Callback received platform=%s path_channel_id=%s", channel.Platform, channelID)
+
 	// Handle URL verification
 	if adapter.HandleURLVerification(c) {
 		return
@@ -284,6 +302,11 @@ func (h *IMHandler) IMCallback(c *gin.Context) {
 
 	// If nil, it's a non-message event - just acknowledge
 	if msg == nil {
+		if channel.Platform == "mattermost" {
+			logger.Infof(ctx, "[IM] Mattermost callback ignored (no message): path_channel_id=%s — check: (1) trigger word must be the *first word* of the post; (2) if channel+trigger are both set, post must be in that channel; (3) bot_user_id must not match the sender", channelID)
+		} else {
+			logger.Infof(ctx, "[IM] Callback parsed no message to process platform=%s path_channel_id=%s", channel.Platform, channelID)
+		}
 		c.JSON(http.StatusOK, gin.H{"success": true})
 		return
 	}

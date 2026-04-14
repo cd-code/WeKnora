@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -424,6 +425,20 @@ func (r *chunkRepository) DeleteChunksByKnowledgeID(ctx context.Context, tenantI
 	).Delete(&types.Chunk{}).Error
 }
 
+// ListImageInfoByKnowledgeIDs returns non-empty image_info values for the given knowledge IDs.
+// No chunk_type filter — collects from text, image_ocr, and image_caption chunks.
+func (r *chunkRepository) ListImageInfoByKnowledgeIDs(
+	ctx context.Context, tenantID uint64, knowledgeIDs []string,
+) ([]interfaces.ChunkImageInfo, error) {
+	var results []interfaces.ChunkImageInfo
+	err := r.db.WithContext(ctx).
+		Model(&types.Chunk{}).
+		Select("knowledge_id, image_info").
+		Where("tenant_id = ? AND knowledge_id IN ? AND image_info != ''", tenantID, knowledgeIDs).
+		Scan(&results).Error
+	return results, err
+}
+
 // DeleteByKnowledgeList deletes all chunks for a knowledge list
 func (r *chunkRepository) DeleteByKnowledgeList(ctx context.Context, tenantID uint64, knowledgeIDs []string) error {
 	return r.db.WithContext(ctx).Where(
@@ -600,6 +615,66 @@ func (r *chunkRepository) ListAllFAQChunksWithMetadataByKnowledgeBaseID(
 	}
 
 	return allChunks, nil
+}
+
+// FindFAQChunkWithDuplicateQuestion finds a single FAQ chunk whose standard_question or
+// similar_questions overlap with the given question list.
+// Uses dialect-specific JSON queries (MySQL / PostgreSQL / SQLite).
+func (r *chunkRepository) FindFAQChunkWithDuplicateQuestion(
+	ctx context.Context,
+	tenantID uint64,
+	kbID string,
+	excludeChunkID string,
+	questions []string,
+) (*types.Chunk, error) {
+	if len(questions) == 0 {
+		return nil, nil
+	}
+
+	db := r.db.WithContext(ctx).
+		Select("id, metadata").
+		Where("tenant_id = ? AND knowledge_base_id = ? AND chunk_type = ? AND status = ? AND id != ?",
+			tenantID, kbID, types.ChunkTypeFAQ, types.ChunkStatusIndexed, excludeChunkID)
+
+	switch r.db.Name() {
+	case "mysql":
+		// MySQL 5.7+: JSON_EXTRACT for standard_question, JSON_CONTAINS for similar_questions
+		parts := []string{
+			"JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.standard_question')) IN ?",
+		}
+		args := []interface{}{questions}
+		for _, q := range questions {
+			parts = append(parts,
+				"JSON_CONTAINS(metadata, ?, '$.similar_questions')")
+			jsonVal, _ := json.Marshal(q)
+			args = append(args, string(jsonVal))
+		}
+		db = db.Where(strings.Join(parts, " OR "), args...)
+	case "postgres":
+		db = db.Where(
+			"(metadata->>'standard_question' IN ? OR EXISTS ("+
+				"SELECT 1 FROM jsonb_array_elements_text("+
+				"COALESCE(metadata->'similar_questions', '[]'::jsonb)) elem "+
+				"WHERE elem.value IN ?))",
+			questions, questions)
+	default: // sqlite
+		db = db.Where(
+			"(json_extract(metadata, '$.standard_question') IN ? OR EXISTS ("+
+				"SELECT 1 FROM json_each("+
+				"CASE WHEN json_extract(metadata, '$.similar_questions') IS NOT NULL "+
+				"THEN json_extract(metadata, '$.similar_questions') ELSE '[]' END) "+
+				"WHERE value IN ?))",
+			questions, questions)
+	}
+
+	var chunk types.Chunk
+	if err := db.Limit(1).Find(&chunk).Error; err != nil {
+		return nil, err
+	}
+	if chunk.ID == "" {
+		return nil, nil
+	}
+	return &chunk, nil
 }
 
 // ListAllFAQChunksForExport lists all FAQ chunks for export with full metadata, tag_id, is_enabled, and flags.
@@ -848,4 +923,103 @@ func (r *chunkRepository) FAQChunkDiff(
 	}
 
 	return chunksToAdd, chunksToDelete, nil
+}
+
+// ListRecommendedFAQChunks lists FAQ chunks with the recommended flag set.
+// Filter by kbIDs and/or knowledgeIDs (OR relationship). At least one must be non-empty.
+// Returns up to `limit` chunks sorted by updated_at descending.
+func (r *chunkRepository) ListRecommendedFAQChunks(
+	ctx context.Context,
+	tenantID uint64,
+	kbIDs []string,
+	knowledgeIDs []string,
+	limit int,
+) ([]*types.Chunk, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if len(kbIDs) == 0 && len(knowledgeIDs) == 0 {
+		return nil, nil
+	}
+	var chunks []*types.Chunk
+	query := r.db.WithContext(ctx).
+		Select("id, knowledge_base_id, chunk_type, metadata, flags, updated_at").
+		Where("tenant_id = ? AND chunk_type = ? AND status IN ? AND is_enabled = ? AND flags & ? != 0",
+			tenantID, types.ChunkTypeFAQ, []int{int(types.ChunkStatusIndexed), int(types.ChunkStatusDefault)}, true, int(types.ChunkFlagRecommended))
+	if len(knowledgeIDs) > 0 {
+		// 指定了具体知识文档，直接按 knowledge_id 过滤（忽略 kbIDs）
+		query = query.Where("knowledge_id IN ?", knowledgeIDs)
+	} else {
+		query = query.Where("knowledge_base_id IN ?", kbIDs)
+	}
+	if err := query.
+		Order("updated_at DESC").
+		Limit(limit).
+		Find(&chunks).Error; err != nil {
+		return nil, err
+	}
+	return chunks, nil
+}
+
+// ListRecentDocumentChunksWithQuestions lists recent document chunks that have generated questions.
+// Filter by kbIDs and/or knowledgeIDs (OR relationship). At least one must be non-empty.
+// Returns up to `limit` chunks sorted by updated_at descending.
+func (r *chunkRepository) ListRecentDocumentChunksWithQuestions(
+	ctx context.Context,
+	tenantID uint64,
+	kbIDs []string,
+	knowledgeIDs []string,
+	limit int,
+) ([]*types.Chunk, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if len(kbIDs) == 0 && len(knowledgeIDs) == 0 {
+		return nil, nil
+	}
+	var chunks []*types.Chunk
+
+	baseQuery := r.db.WithContext(ctx).
+		Select("id, knowledge_base_id, chunk_type, metadata, updated_at").
+		Where("tenant_id = ? AND chunk_type = ? AND status IN ? AND is_enabled = ?",
+			tenantID, types.ChunkTypeText, []int{int(types.ChunkStatusIndexed), int(types.ChunkStatusDefault)}, true)
+
+	if len(kbIDs) > 0 && len(knowledgeIDs) > 0 {
+		baseQuery = baseQuery.Where("knowledge_base_id IN ? OR knowledge_id IN ?", kbIDs, knowledgeIDs)
+	} else if len(knowledgeIDs) > 0 {
+		// 指定了具体知识文档，直接按 knowledge_id 过滤（忽略 kbIDs）
+		baseQuery = baseQuery.Where("knowledge_id IN ?", knowledgeIDs)
+	} else if len(kbIDs) > 0 {
+		baseQuery = baseQuery.Where("knowledge_base_id IN ?", kbIDs)
+	}
+
+	// Query chunks that have non-empty generated_questions in metadata
+	switch r.db.Name() {
+	case "postgres":
+		if err := baseQuery.
+			Where("metadata IS NOT NULL AND metadata::text != '{}' AND jsonb_array_length(COALESCE(metadata->'generated_questions', '[]'::jsonb)) > 0").
+			Order("updated_at DESC").
+			Limit(limit).
+			Find(&chunks).Error; err != nil {
+			return nil, err
+		}
+	case "mysql":
+		if err := baseQuery.
+			Where("metadata IS NOT NULL AND JSON_LENGTH(JSON_EXTRACT(metadata, '$.generated_questions')) > 0").
+			Order("updated_at DESC").
+			Limit(limit).
+			Find(&chunks).Error; err != nil {
+			return nil, err
+		}
+	default: // sqlite
+		if err := baseQuery.
+			Where("metadata IS NOT NULL AND json_array_length(json_extract(metadata, '$.generated_questions')) > 0").
+			Order("updated_at DESC").
+			Limit(limit).
+			Find(&chunks).Error; err != nil {
+			return nil, err
+		}
+	}
+
+	return chunks, nil
 }

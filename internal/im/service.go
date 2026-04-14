@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/textproto"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +36,22 @@ const (
 	dedupCleanupInterval = 1 * time.Minute
 	// maxContentLength is the maximum allowed message content length.
 	maxContentLength = 4096
+	// maxQuoteContentLength is the max runes to include from a quoted message.
+	maxQuoteContentLength = 500
 	// streamFlushInterval is how often buffered stream content is flushed to the IM platform.
 	// This prevents API rate-limiting while keeping perceived latency low.
 	streamFlushInterval = 300 * time.Millisecond
 )
+
+// imCitationTagRe matches inline citation tags produced by the agent pipeline.
+// These tags are rendered as interactive UI in the web frontend but are meaningless
+// in IM platforms, so they must be stripped before sending.
+var imCitationTagRe = regexp.MustCompile(`<(?:kb|web)\b[^>]*/?>`)
+
+// stripIMCitationTags removes <kb .../> and <web .../> inline citation tags from s.
+func stripIMCitationTags(s string) string {
+	return imCitationTagRe.ReplaceAllString(s, "")
+}
 
 const (
 	// wsLeaderTTL is the TTL for the Redis key used for WebSocket leader election.
@@ -57,13 +70,13 @@ const (
 // All IM-related Redis keys are defined here for discoverability and to avoid
 // scattered string literals across multiple files.
 const (
-	RedisKeyLeader     = "im:ws:leader:"     // + channelID — WebSocket leader election
-	RedisKeyDedup      = "im:dedup:"         // + messageID — message deduplication
-	RedisKeyStop       = "im:stop:"          // + userKey   — cross-instance /stop marker (pre-execution)
-	RedisKeyInflight   = "im:inflight:"      // + userKey   — maps userKey → sessionID:messageID for cross-instance /stop
-	RedisKeyQueueUser  = "im:queue:user:"    // + userKey   — global per-user queue counter
-	RedisKeyRateLimit  = "im:ratelimit:"     // + key       — sliding-window rate limiting
-	RedisKeyGlobalGate = "im:global:active"  // global concurrent worker counter
+	RedisKeyLeader     = "im:ws:leader:"    // + channelID — WebSocket leader election
+	RedisKeyDedup      = "im:dedup:"        // + messageID — message deduplication
+	RedisKeyStop       = "im:stop:"         // + userKey   — cross-instance /stop marker (pre-execution)
+	RedisKeyInflight   = "im:inflight:"     // + userKey   — maps userKey → sessionID:messageID for cross-instance /stop
+	RedisKeyQueueUser  = "im:queue:user:"   // + userKey   — global per-user queue counter
+	RedisKeyRateLimit  = "im:ratelimit:"    // + key       — sliding-window rate limiting
+	RedisKeyGlobalGate = "im:global:active" // global concurrent worker counter
 )
 
 // channelState holds runtime state for a running IM channel.
@@ -151,8 +164,54 @@ type Service struct {
 
 // makeUserKey builds the canonical key used to identify a user's request
 // across the queue, inflight map, and /stop command.
-func makeUserKey(channelID, userID, chatID string) string {
+// threadID should only be non-empty when channel.SessionMode == "thread";
+// callers must guard this to avoid leaking thread scope into user-mode keys.
+func makeUserKey(channelID, userID, chatID, threadID string) string {
+	if threadID != "" {
+		return fmt.Sprintf("%s:%s:%s:%s", channelID, userID, chatID, threadID)
+	}
 	return fmt.Sprintf("%s:%s:%s", channelID, userID, chatID)
+}
+
+// nonTextTypeLabel maps a message type to a Chinese label for LLM instructions.
+var nonTextTypeLabel = map[string]string{
+	"image": "图片",
+	"file":  "文件",
+	"video": "视频",
+	"voice": "语音",
+}
+
+// formatQuotedContext formats a QuotedMessage into a labeled string for LLM context.
+// Returns empty string if quote is nil.
+// For non-text quotes, generates an instruction telling the LLM to acknowledge
+// the unprocessable content instead of a placeholder that causes hallucination.
+func formatQuotedContext(quote *QuotedMessage) string {
+	if quote == nil {
+		return ""
+	}
+	// Non-text quote: generate instruction, not content placeholder.
+	if quote.NonTextType != "" {
+		label := nonTextTypeLabel[quote.NonTextType]
+		if label == "" {
+			label = "该类型的"
+		}
+		return "用户引用了一条" + label + "消息，但你无法查看该内容。请直接告知用户你目前无法处理" + label + "消息，建议用户用文字描述问题。不要猜测该消息的内容。"
+	}
+	if quote.Content == "" {
+		return ""
+	}
+	content := quote.Content
+	runes := []rune(content)
+	if len(runes) > maxQuoteContentLength {
+		content = string(runes[:maxQuoteContentLength]) + "..."
+	}
+	// Prevent quoted content from escaping the XML tag boundary.
+	content = strings.ReplaceAll(content, "</quoted_message>", "")
+	label := "以下是用户引用的一条历史消息，仅作为上下文参考："
+	if quote.IsBotMessage {
+		label = "以下是用户引用的你（机器人）之前的回复，仅作为上下文参考："
+	}
+	return label + "\n<quoted_message>\n" + content + "\n</quoted_message>"
 }
 
 func buildIMQARequest(
@@ -162,11 +221,13 @@ func buildIMQARequest(
 	userMessageID string,
 	customAgent *types.CustomAgent,
 	kbIDs []string,
+	quote *QuotedMessage,
 ) *types.QARequest {
 	// WebSearchEnabled: the web handler passes this per-request from the
 	// frontend toggle; for IM channels the user has no per-message toggle,
 	// so we derive it from the agent config (the single source of truth).
 	webSearchEnabled := customAgent != nil && customAgent.Config.WebSearchEnabled
+	quotedContext := formatQuotedContext(quote)
 	return &types.QARequest{
 		Session:            session,
 		Query:              query,
@@ -175,6 +236,7 @@ func buildIMQARequest(
 		KnowledgeBaseIDs:   kbIDs,
 		UserMessageID:      userMessageID,
 		WebSearchEnabled:   webSearchEnabled,
+		QuotedContext:      quotedContext,
 	}
 }
 
@@ -372,12 +434,14 @@ func (s *Service) StartChannel(channel *IMChannel) error {
 	}
 	s.mu.Unlock()
 
-	// For WebSocket channels, try leader election to avoid duplicate connections.
-	if channel.Mode == "websocket" && s.redis != nil {
+	// For WebSocket / long-poll channels, try leader election to avoid
+	// duplicate connections. Only one instance should actively poll or
+	// maintain a persistent connection for each channel.
+	if (channel.Mode == "websocket" || channel.Mode == "longpoll") && s.redis != nil {
 		acquired := s.tryAcquireWSLeader(channel.ID)
 		if !acquired {
 			logger.Infof(context.Background(),
-				"[IM] Channel %s WebSocket owned by another instance, will retry", channel.ID)
+				"[IM] Channel %s %s owned by another instance, will retry", channel.ID, channel.Mode)
 			go s.wsLeaderRetryLoop(channel)
 			return nil
 		}
@@ -400,9 +464,9 @@ func (s *Service) startChannelInternal(channel *IMChannel, factory AdapterFactor
 		return fmt.Errorf("create adapter: %w", err)
 	}
 
-	// Start leader renewal goroutine for WebSocket channels.
+	// Start leader renewal goroutine for WebSocket / long-poll channels.
 	var leaderCancel context.CancelFunc
-	if channel.Mode == "websocket" && s.redis != nil {
+	if (channel.Mode == "websocket" || channel.Mode == "longpoll") && s.redis != nil {
 		leaderCtx, lCancel := context.WithCancel(context.Background())
 		leaderCancel = lCancel
 		go s.wsLeaderRenewLoop(leaderCtx, channel.ID)
@@ -439,8 +503,18 @@ func (s *Service) stopChannelLocked(channelID string, cs *channelState) {
 		cs.Cancel()
 	}
 	delete(s.channels, channelID)
-	s.releaseWSLeader(channelID)
-	logger.Infof(context.Background(), "[IM] Stopped channel: id=%s", channelID)
+	// For long-poll channels, do NOT release the leader lock immediately.
+	// Let it expire naturally via TTL so the old poll goroutine has time to
+	// fully drain before another instance takes over. This prevents a brief
+	// dual-writer window where both old and new instances process messages.
+	// For websocket channels, the connection closes synchronously, so
+	// immediate release is safe.
+	if cs.Channel != nil && cs.Channel.Mode == "longpoll" {
+		logger.Infof(context.Background(), "[IM] Stopped longpoll channel: id=%s (leader lock will expire via TTL)", channelID)
+	} else {
+		s.releaseWSLeader(channelID)
+		logger.Infof(context.Background(), "[IM] Stopped channel: id=%s", channelID)
+	}
 }
 
 // ── WebSocket leader election ───────────────────────────────────────────────
@@ -716,7 +790,9 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		attribute.String("im.platform", string(msg.Platform)),
 		attribute.String("im.user_id", msg.UserID),
 		attribute.String("im.chat_id", msg.ChatID),
+		attribute.String("im.thread_id", msg.ThreadID),
 		attribute.String("im.message_type", string(msg.MessageType)),
+		attribute.Bool("im.has_quote", msg.Quote != nil),
 	)
 
 	// Dedup: skip if this message was already processed (IM platforms may retry)
@@ -752,12 +828,21 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		}
 	}
 
+	span.SetAttributes(attribute.String("im.session_mode", channel.SessionMode))
+
+	// Resolve threadID for key building — only include in thread mode to avoid
+	// leaking thread scope into user-mode rate limit / inflight keys.
+	threadID := ""
+	if channel.SessionMode == string(SessionModeThread) {
+		threadID = msg.ThreadID
+	}
+
 	// Rate limit: enforce per-user sliding window to prevent abuse.
 	// Slash-commands (/stop, /clear, etc.) bypass rate limiting so the user
 	// always retains control over the bot even under heavy messaging.
 	isCommand := s.cmdRegistry.IsRegistered(msg.Content)
 	if !isCommand {
-		rateLimitKey := makeUserKey(channelID, msg.UserID, msg.ChatID)
+		rateLimitKey := makeUserKey(channelID, msg.UserID, msg.ChatID, threadID)
 		if !s.rateLimiter.Allow(rateLimitKey) {
 			logger.Warnf(ctx, "[IM] Rate limited: channel=%s user=%s chat=%s", channelID, msg.UserID, msg.ChatID)
 			_ = adapter.SendReply(ctx, msg, &ReplyMessage{
@@ -783,6 +868,21 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		return s.handleFileMessage(ctx, msg, adapter, channel)
 	}
 
+	// ── Non-text message without text content ──
+	// If the message is an image/file/video but has no text content, the QA pipeline
+	// cannot do anything useful (no vision support in IM yet). Sending an empty query
+	// to KB retrieval would return irrelevant results and cause hallucination.
+	if msg.Content == "" && (msg.MessageType == MessageTypeImage || msg.MessageType == MessageTypeFile) {
+		logger.Infof(ctx, "[IM] Skipping QA for non-text message without content: type=%s", msg.MessageType)
+		if err := adapter.SendReply(ctx, msg, &ReplyMessage{
+			Content: "当前渠道未配置文件知识库，无法处理图片/文件消息。请在渠道设置中配置文件知识库后再发送，或直接用文字描述您的问题。",
+			IsFinal: true,
+		}); err != nil {
+			logger.Warnf(ctx, "[IM] Failed to send non-text hint reply: %v", err)
+		}
+		return nil
+	}
+
 	// 1. Get tenant
 	tenant, err := s.tenantService.GetTenantByID(ctx, tenantID)
 	if err != nil {
@@ -792,7 +892,7 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 	sessionCtx = context.WithValue(sessionCtx, types.TenantInfoContextKey, tenant)
 
 	// 2. Resolve or create a WeKnora session
-	channelSession, err := s.resolveSession(sessionCtx, msg, tenantID, agentID, channelID)
+	channelSession, err := s.resolveSession(sessionCtx, msg, tenantID, agentID, channelID, channel.SessionMode)
 	if err != nil {
 		return fmt.Errorf("resolve session: %w", err)
 	}
@@ -831,7 +931,7 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 	// 5. Enqueue the QA request into the bounded worker pool.
 	// The worker pool controls LLM concurrency and provides backpressure.
 	qaCtx, qaCancel := context.WithCancel(sessionCtx)
-	userKey := makeUserKey(channelID, msg.UserID, msg.ChatID)
+	userKey := makeUserKey(channelID, msg.UserID, msg.ChatID, threadID)
 
 	req := &qaRequest{
 		ctx:       qaCtx,
@@ -922,7 +1022,7 @@ func (s *Service) executeQARequest(req *qaRequest) {
 	}
 
 	// Non-streaming fallback: collect full answer then send.
-	answer, err := s.runQA(ctx, req.session, req.msg.Content, req.agent, kbIDs, req.userKey)
+	answer, err := s.runQA(ctx, req.session, req.msg.Content, req.agent, kbIDs, req.userKey, req.msg.Quote)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		logger.Errorf(ctx, "[IM] QA failed: %v, sending fallback reply", err)
@@ -1000,7 +1100,11 @@ func (s *Service) handleCommand(
 			logger.Warnf(ctx, "[IM] Failed to clear session context: %v", err)
 		}
 	case ActionStop:
-		inflightKey := makeUserKey(channel.ID, msg.UserID, msg.ChatID)
+		stopThreadID := ""
+		if channel.SessionMode == string(SessionModeThread) {
+			stopThreadID = msg.ThreadID
+		}
+		inflightKey := makeUserKey(channel.ID, msg.UserID, msg.ChatID, stopThreadID)
 
 		// 1. Try local cancel: remove from queue or cancel in-flight.
 		var localSessionID, localMessageID string
@@ -1080,9 +1184,20 @@ func (s *Service) sendStreamReply(ctx context.Context, msg *IncomingMessage, str
 	return nil
 }
 
-// resolveSession finds or creates a ChannelSession for the given IM message.
-// ctx must already carry TenantIDContextKey and TenantInfoContextKey.
-func (s *Service) resolveSession(ctx context.Context, msg *IncomingMessage, tenantID uint64, agentID string, imChannelID string) (*ChannelSession, error) {
+// resolveSession dispatches to the appropriate session resolution strategy
+// based on the channel's session mode.
+func (s *Service) resolveSession(ctx context.Context, msg *IncomingMessage, tenantID uint64, agentID string, imChannelID string, sessionMode string) (*ChannelSession, error) {
+	switch SessionMode(sessionMode) {
+	case SessionModeThread:
+		return s.resolveThreadSession(ctx, msg, tenantID, agentID, imChannelID)
+	default: // SessionModeUser
+		return s.resolveUserSession(ctx, msg, tenantID, agentID, imChannelID)
+	}
+}
+
+// resolveUserSession finds or creates a ChannelSession keyed by (platform, user_id, chat_id, tenant_id).
+// This is the original session resolution strategy.
+func (s *Service) resolveUserSession(ctx context.Context, msg *IncomingMessage, tenantID uint64, agentID string, imChannelID string) (*ChannelSession, error) {
 	var cs ChannelSession
 	result := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND deleted_at IS NULL",
 		string(msg.Platform), msg.UserID, msg.ChatID, tenantID).
@@ -1125,14 +1240,9 @@ func (s *Service) resolveSession(ctx context.Context, msg *IncomingMessage, tena
 		IMChannelID: imChannelID,
 	}
 	if err := s.db.Create(&cs).Error; err != nil {
-		// The insert failed (likely unique constraint from a concurrent request on
-		// another instance). Clean up the orphaned Session we just created — it has
-		// no messages yet, so a direct delete is safe.
 		if delErr := s.db.Where("id = ?", createdSession.ID).Delete(createdSession).Error; delErr != nil {
 			logger.Warnf(ctx, "[IM] Failed to clean up orphaned session %s: %v", createdSession.ID, delErr)
 		}
-
-		// Fetch the existing ChannelSession created by the winning instance.
 		var existing ChannelSession
 		if findErr := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND deleted_at IS NULL",
 			string(msg.Platform), msg.UserID, msg.ChatID, tenantID).
@@ -1145,6 +1255,83 @@ func (s *Service) resolveSession(ctx context.Context, msg *IncomingMessage, tena
 	logger.Infof(ctx, "[IM] Created new session mapping: channel=%s/%s/%s -> session=%s",
 		msg.Platform, msg.UserID, msg.ChatID, createdSession.ID)
 
+	return &cs, nil
+}
+
+// resolveThreadSession finds or creates a ChannelSession keyed by (platform, chat_id, thread_id, tenant_id).
+// In thread mode, each message thread gets its own session. Multiple users in the
+// same thread share the same session. Top-level messages use their own ID as
+// ThreadID, creating a new session per top-level message.
+func (s *Service) resolveThreadSession(ctx context.Context, msg *IncomingMessage, tenantID uint64, agentID string, imChannelID string) (*ChannelSession, error) {
+	threadID := msg.ThreadID
+	if threadID == "" {
+		// Defense-in-depth: frontend blocks thread mode for unsupported platforms,
+		// but if ThreadID is somehow empty, fall back to user-mode resolution
+		// to avoid creating a shared session for all empty-thread messages.
+		logger.Warnf(ctx, "[IM] Thread mode but ThreadID is empty (platform=%s chat=%s), falling back to user session", msg.Platform, msg.ChatID)
+		return s.resolveUserSession(ctx, msg, tenantID, agentID, imChannelID)
+	}
+
+	var cs ChannelSession
+	result := s.db.Where(
+		"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+		string(msg.Platform), threadID, msg.ChatID, tenantID,
+	).First(&cs)
+
+	if result.Error == nil {
+		return &cs, nil
+	}
+
+	if result.Error != gorm.ErrRecordNotFound {
+		return nil, fmt.Errorf("query thread session: %w", result.Error)
+	}
+
+	// Build a session title with thread ID suffix for traceability.
+	threadSuffix := threadID
+	if len(threadSuffix) > 8 {
+		threadSuffix = threadSuffix[len(threadSuffix)-8:]
+	}
+	title := fmt.Sprintf("IM-%s-thread-%s", msg.Platform, threadSuffix)
+
+	newSession := &types.Session{
+		TenantID:    tenantID,
+		Title:       title,
+		Description: fmt.Sprintf("Thread-based session from %s IM", msg.Platform),
+	}
+
+	createdSession, err := s.sessionService.CreateSession(ctx, newSession)
+	if err != nil {
+		return nil, fmt.Errorf("create session: %w", err)
+	}
+
+	cs = ChannelSession{
+		Platform:    string(msg.Platform),
+		UserID:      msg.UserID, // record the first creator
+		ChatID:      msg.ChatID,
+		ThreadID:    threadID,
+		SessionID:   createdSession.ID,
+		TenantID:    tenantID,
+		AgentID:     agentID,
+		IMChannelID: imChannelID,
+	}
+
+	if err := s.db.Create(&cs).Error; err != nil {
+		// Unique constraint fallback for concurrent creation.
+		if delErr := s.db.Where("id = ?", createdSession.ID).Delete(createdSession).Error; delErr != nil {
+			logger.Warnf(ctx, "[IM] Failed to clean up orphaned session %s: %v", createdSession.ID, delErr)
+		}
+		var existing ChannelSession
+		if findErr := s.db.Where(
+			"platform = ? AND chat_id = ? AND thread_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+			string(msg.Platform), msg.ChatID, threadID, tenantID,
+		).First(&existing).Error; findErr != nil {
+			return nil, fmt.Errorf("create thread session: %w (lookup fallback: %v)", err, findErr)
+		}
+		return &existing, nil
+	}
+
+	logger.Infof(ctx, "[IM] Created new thread session: platform=%s thread=%s chat=%s -> session=%s",
+		msg.Platform, threadID, msg.ChatID, createdSession.ID)
 	return &cs, nil
 }
 
@@ -1424,6 +1611,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 	userMsg, err := s.messageService.CreateMessage(qaCtx, &types.Message{
 		SessionID: session.ID, Role: "user", Content: msg.Content,
 		RequestID: requestID, CreatedAt: time.Now(), IsCompleted: true,
+		Channel: "im",
 	})
 	if err != nil {
 		return fmt.Errorf("create user message: %w", err)
@@ -1433,6 +1621,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 	assistantMsg, err := s.messageService.CreateMessage(qaCtx, &types.Message{
 		SessionID: session.ID, Role: "assistant",
 		RequestID: requestID, CreatedAt: time.Now(), IsCompleted: false,
+		Channel: "im",
 	})
 	if err != nil {
 		return fmt.Errorf("create assistant message: %w", err)
@@ -1455,7 +1644,10 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 	// Run QA async
 	go func() {
 		var err error
-		req := buildIMQARequest(session, msg.Content, assistantMsg.ID, userMsg.ID, customAgent, kbIDs)
+		req := buildIMQARequest(session, msg.Content, assistantMsg.ID, userMsg.ID, customAgent, kbIDs, msg.Quote)
+		if req.QuotedContext != "" {
+			logger.Debugf(qaCtx, "[IM] QuotedContext set: length=%d", len(req.QuotedContext))
+		}
 		if useAgent {
 			err = s.sessionService.AgentQA(qaCtx, req, eventBus)
 		} else {
@@ -1481,7 +1673,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 		bufMu.Unlock()
 
 		if chunk != "" {
-			if err := streamer.SendStreamChunk(ctx, msg, streamID, chunk); err != nil {
+			if err := streamer.SendStreamChunk(ctx, msg, streamID, stripIMCitationTags(chunk)); err != nil {
 				logger.Warnf(ctx, "[IM] SendStreamChunk failed: %v", err)
 			}
 		}
@@ -1545,7 +1737,7 @@ loop:
 
 // fallbackNonStream is used when streaming initialization fails.
 func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, adapter Adapter, userKey string) error {
-	answer, err := s.runQA(ctx, session, msg.Content, customAgent, kbIDs, userKey)
+	answer, err := s.runQA(ctx, session, msg.Content, customAgent, kbIDs, userKey, msg.Quote)
 	if err != nil {
 		logger.Errorf(ctx, "[IM] QA fallback failed: %v", err)
 		answer = "抱歉，处理您的问题时出现了异常，请稍后再试。"
@@ -1555,7 +1747,7 @@ func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, s
 }
 
 // runQA executes the WeKnora QA pipeline and returns the full answer text.
-func (s *Service) runQA(ctx context.Context, session *types.Session, query string, customAgent *types.CustomAgent, kbIDs []string, userKey string) (string, error) {
+func (s *Service) runQA(ctx context.Context, session *types.Session, query string, customAgent *types.CustomAgent, kbIDs []string, userKey string, quote *QuotedMessage) (string, error) {
 	// Add timeout to prevent indefinite blocking
 	ctx, cancel := context.WithTimeout(ctx, qaTimeout)
 	defer cancel()
@@ -1611,6 +1803,7 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 		RequestID:   requestID,
 		CreatedAt:   time.Now(),
 		IsCompleted: true,
+		Channel:     "im",
 	})
 	if err != nil {
 		return "", fmt.Errorf("create user message: %w", err)
@@ -1623,6 +1816,7 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 		RequestID:   requestID,
 		CreatedAt:   time.Now(),
 		IsCompleted: false,
+		Channel:     "im",
 	})
 	if err != nil {
 		return "", fmt.Errorf("create assistant message: %w", err)
@@ -1643,7 +1837,10 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 	// Run QA async
 	go func() {
 		var err error
-		req := buildIMQARequest(session, query, assistantMsg.ID, userMsg.ID, customAgent, kbIDs)
+		req := buildIMQARequest(session, query, assistantMsg.ID, userMsg.ID, customAgent, kbIDs, quote)
+		if req.QuotedContext != "" {
+			logger.Debugf(ctx, "[IM] QuotedContext set: length=%d", len(req.QuotedContext))
+		}
 		if useAgent {
 			err = s.sessionService.AgentQA(ctx, req, eventBus)
 		} else {
@@ -1684,14 +1881,16 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 		answer = "抱歉，我暂时无法回答这个问题。"
 	}
 
-	// Update assistant message with the final answer content
+	// Update assistant message with the full answer (including citation tags for web rendering).
 	assistantMsg.Content = answer
 	assistantMsg.IsCompleted = true
 	if err := s.messageService.UpdateMessage(ctx, assistantMsg); err != nil {
 		logger.Warnf(ctx, "[IM] Failed to update assistant message: %v", err)
 	}
 
-	return answer, nil
+	// Strip citation tags before returning to the IM adapter — IM platforms cannot
+	// render <kb .../> / <web .../> and would display them as raw text.
+	return stripIMCitationTags(answer), nil
 }
 
 // ── CRUD operations for IM channels ──
@@ -1848,18 +2047,6 @@ func (s *Service) handleFileMessage(ctx context.Context, msg *IncomingMessage, a
 			fmt.Sprintf("❌ 不支持的文件类型「%s」。\n\n支持的类型：PDF、Word、TXT、Markdown、Excel、CSV、PPT、图片。", ext))
 	}
 
-	displayName := msg.FileName
-	if ext == "" {
-		displayName = "文件"
-	}
-
-	// Send "processing started" notification (streaming)
-	if err := s.sendSmartReply(ctx, adapter, msg, channel,
-		fmt.Sprintf("用户发送了一个文件「%s」，系统正在处理并保存到知识库中，需要告知用户请稍候。", displayName),
-		fmt.Sprintf("📥 已收到%s，正在处理并保存到知识库，请稍候...", displayName)); err != nil {
-		logger.Warnf(ctx, "[IM] Failed to send file processing start notification: %v", err)
-	}
-
 	// Process asynchronously to avoid blocking the message handler
 	go s.processFileToKnowledgeBase(context.WithoutCancel(ctx), msg, downloader, adapter, channel)
 
@@ -1915,7 +2102,7 @@ func (s *Service) processFileToKnowledgeBase(ctx context.Context, msg *IncomingM
 	fh := newInMemoryFileHeader(fileName, content)
 
 	// Create knowledge entry via the knowledge service
-	knowledge, err := s.knowledgeService.CreateKnowledgeFromFile(kbCtx, kbID, fh, nil, nil, "", "")
+	knowledge, err := s.knowledgeService.CreateKnowledgeFromFile(kbCtx, kbID, fh, nil, nil, "", "", imPlatformToChannel(channel.Platform))
 	if err != nil {
 		errMsg := err.Error()
 		// Check for duplicate file
@@ -1942,18 +2129,20 @@ func (s *Service) processFileToKnowledgeBase(ctx context.Context, msg *IncomingM
 // It uses sendSmartReply to generate a friendly, streaming reply via the channel's LLM.
 // Falls back to a static template if the LLM is unavailable.
 func (s *Service) sendFileResult(ctx context.Context, adapter Adapter, msg *IncomingMessage, fileName string, success bool, errDetail string, channel *IMChannel) {
+	typeName := fileTypeName(fileName)
+
 	var fallback string
 	if success {
-		fallback = fmt.Sprintf("✅ 文件「%s」已保存到知识库，正在解析中，完成后会通知你～", fileName)
+		fallback = fmt.Sprintf("✅ %s已保存到知识库，正在解析中，完成后会通知你～", typeName)
 	} else {
-		fallback = fmt.Sprintf("❌ 文件「%s」处理失败：%s", fileName, errDetail)
+		fallback = fmt.Sprintf("❌ %s处理失败：%s", typeName, errDetail)
 	}
 
 	var situation string
 	if success {
-		situation = fmt.Sprintf("用户上传的文件「%s」已成功保存到知识库，但还需要后台解析文档内容（这需要一些时间）。请告知用户文件已收到，正在解析处理中，解析完成后会自动推送结果。", fileName)
+		situation = fmt.Sprintf("用户上传的%s已成功保存到知识库，但还需要后台解析文档内容（这需要一些时间）。请告知用户文件已收到，正在解析处理中，解析完成后会自动推送结果。", typeName)
 	} else {
-		situation = fmt.Sprintf("用户上传的文件「%s」处理失败，原因：%s。", fileName, errDetail)
+		situation = fmt.Sprintf("用户上传的%s处理失败，原因：%s。", typeName, errDetail)
 	}
 
 	if err := s.sendSmartReply(ctx, adapter, msg, channel, situation, fallback); err != nil {
@@ -2172,6 +2361,8 @@ func (s *Service) watchAndSendSummary(
 				return
 			}
 
+			typeName := fileTypeName(fileName)
+
 			switch knowledge.ParseStatus {
 			case types.ParseStatusFailed:
 				// Parsing failed — notify user and stop watching
@@ -2180,8 +2371,8 @@ func (s *Service) watchAndSendSummary(
 					errMsg = "文档解析失败"
 				}
 				_ = s.sendSmartReply(ctx, adapter, msg, channel,
-					fmt.Sprintf("用户之前上传的文件「%s」解析失败了，错误原因：%s。请安慰用户并建议重试。", fileName, errMsg),
-					fmt.Sprintf("⚠️ 文件「%s」解析失败：%s", fileName, errMsg))
+					fmt.Sprintf("用户之前上传的%s解析失败了，错误原因：%s。请安慰用户并建议重试。", typeName, errMsg),
+					fmt.Sprintf("⚠️ %s解析失败：%s", typeName, errMsg))
 				return
 
 			case types.ParseStatusCompleted:
@@ -2193,12 +2384,12 @@ func (s *Service) watchAndSendSummary(
 					// still show it if present.
 					if knowledge.Description != "" && knowledge.Description != fileName {
 						_ = s.sendSmartReply(ctx, adapter, msg, channel,
-							fmt.Sprintf("用户之前上传的文件「%s」已解析完成。以下是文件的完整摘要内容：\n%s\n\n请生成一条通知消息，包含：1) 告知文件已解析完成；2) 用 Markdown 格式（标题、列表、加粗等）结构化展示上述摘要内容，不要删减或概括；3) 提示用户可以针对该文件提问。", fileName, knowledge.Description),
-							fmt.Sprintf("📄 文件「%s」已解析完成。\n\n**摘要：**\n\n%s\n\n---\n可以针对该文件进行提问。", fileName, knowledge.Description))
+							fmt.Sprintf("用户之前上传的%s已解析完成。以下是文件的完整摘要内容：\n%s\n\n请生成一条通知消息，包含：1) 告知文件已解析完成；2) 用 Markdown 格式（标题、列表、加粗等）结构化展示上述摘要内容，不要删减或概括；3) 提示用户可以针对该文件提问。", typeName, knowledge.Description),
+							fmt.Sprintf("📄 %s已解析完成。\n\n**摘要：**\n\n%s\n\n---\n可以针对该文件进行提问。", typeName, knowledge.Description))
 					} else {
 						_ = s.sendSmartReply(ctx, adapter, msg, channel,
-							fmt.Sprintf("用户之前上传的文件「%s」已解析完成，现在可以开始针对该文件进行提问了。", fileName),
-							fmt.Sprintf("📄 文件「%s」已解析完成，可以开始提问了！", fileName))
+							fmt.Sprintf("用户之前上传的%s已解析完成，现在可以开始针对该文件进行提问了。", typeName),
+							fmt.Sprintf("📄 %s已解析完成，可以开始提问了！", typeName))
 					}
 					return
 
@@ -2209,8 +2400,8 @@ func (s *Service) watchAndSendSummary(
 
 				case types.SummaryStatusFailed:
 					_ = s.sendSmartReply(ctx, adapter, msg, channel,
-						fmt.Sprintf("用户之前上传的文件「%s」已解析完成，但摘要生成失败了。不过文件已可用于提问。", fileName),
-						fmt.Sprintf("📄 文件「%s」已解析完成，可以开始提问了！（摘要生成失败）", fileName))
+						fmt.Sprintf("用户之前上传的%s已解析完成，但摘要生成失败了。不过文件已可用于提问。", typeName),
+						fmt.Sprintf("📄 %s已解析完成，可以开始提问了！（摘要生成失败）", typeName))
 					return
 
 				default:
@@ -2242,13 +2433,14 @@ func (s *Service) sendSummaryNotification(
 		summary = knowledge.Title
 	}
 
+	typeName := fileTypeName(fileName)
 	var situation, fallback string
 	if summary != "" && summary != fileName {
-		situation = fmt.Sprintf("用户之前上传的文件「%s」已解析完成。以下是文件的完整摘要内容：\n%s\n\n请生成一条通知消息，包含：1) 告知文件已解析完成；2) 用 Markdown 格式（标题、列表、加粗等）结构化展示上述摘要内容，不要删减或概括；3) 提示用户可以针对该文件提问。", fileName, summary)
-		fallback = fmt.Sprintf("📄 文件「%s」已解析完成。\n\n**摘要：**\n\n%s\n\n---\n可以针对该文件进行提问。", fileName, summary)
+		situation = fmt.Sprintf("用户之前上传的%s已解析完成。以下是文件的完整摘要内容：\n%s\n\n请生成一条通知消息，包含：1) 告知文件已解析完成；2) 用 Markdown 格式（标题、列表、加粗等）结构化展示上述摘要内容，不要删减或概括；3) 提示用户可以针对该文件提问。", typeName, summary)
+		fallback = fmt.Sprintf("📄 %s已解析完成。\n\n**摘要：**\n\n%s\n\n---\n可以针对该文件进行提问。", typeName, summary)
 	} else {
-		situation = fmt.Sprintf("用户之前上传的文件「%s」已解析完成，现在可以开始针对该文件进行提问了。", fileName)
-		fallback = fmt.Sprintf("📄 文件「%s」已解析完成，可以开始提问了！", fileName)
+		situation = fmt.Sprintf("用户之前上传的%s已解析完成，现在可以开始针对该文件进行提问了。", typeName)
+		fallback = fmt.Sprintf("📄 %s已解析完成，可以开始提问了！", typeName)
 	}
 
 	if err := s.sendSmartReply(ctx, adapter, msg, channel, situation, fallback); err != nil {
@@ -2263,6 +2455,48 @@ func fileExtension(filename string) string {
 		return ""
 	}
 	return strings.ToLower(parts[len(parts)-1])
+}
+
+// imPlatformToChannel maps an IM platform identifier to a Knowledge.Channel constant.
+func imPlatformToChannel(platform string) string {
+	switch strings.ToLower(platform) {
+	case "wechat":
+		return types.ChannelWechat
+	case "wecom", "wxwork":
+		return types.ChannelWecom
+	case "feishu", "lark":
+		return types.ChannelFeishu
+	case "dingtalk":
+		return types.ChannelDingtalk
+	case "slack":
+		return types.ChannelSlack
+	default:
+		return types.ChannelIM
+	}
+}
+
+// fileTypeName returns a human-readable file type name based on the file extension.
+func fileTypeName(filename string) string {
+	switch fileExtension(filename) {
+	case "pdf":
+		return "PDF 文档"
+	case "doc", "docx":
+		return "Word 文档"
+	case "txt":
+		return "文本文件"
+	case "md", "markdown":
+		return "Markdown 文档"
+	case "png", "jpg", "jpeg", "gif":
+		return "图片"
+	case "csv":
+		return "CSV 表格"
+	case "xls", "xlsx":
+		return "Excel 表格"
+	case "ppt", "pptx":
+		return "PPT 演示文稿"
+	default:
+		return "文件"
+	}
 }
 
 // newInMemoryFileHeader wraps in-memory file content as a *multipart.FileHeader
